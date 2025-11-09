@@ -37,3 +37,6 @@ This is done by sending markers at specific points
 to the message channels in the subinterpreters.
 - Interruption (cooperative):
 Cells that take too long to execute can be interrupted.
+
+The design philosophy of `kython-mcp` is similar to that of [`kmux`](https://github.com/creative-koalas/kmux.git);
+block-oriented execution, AI-friendly ergonomics, etc.
