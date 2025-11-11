@@ -1,7 +1,14 @@
 [project]
 name = "kython-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Python interpreter MCP server with subinterpreter-based REPL"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+kython-mcp = "kython_mcp.server:main"

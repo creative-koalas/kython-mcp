@@ -8,6 +8,10 @@ build/
 dist/
 wheels/
 *.egg-info
+olds/
 
 # Virtual environments
 .venv
+
+# Environment variables
+.env
