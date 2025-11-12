@@ -13,6 +13,7 @@ Python 3.14+ Interpreters 异步执行器
 """
 
 import asyncio
+import ctypes
 import json
 import threading
 import time
@@ -47,6 +48,76 @@ class _QueueWriter:
 
 sys.stdout = _QueueWriter("stdout", out_queue)
 sys.stderr = _QueueWriter("stderr", out_queue)
+
+class _QueueReader:
+    def __init__(self, in_q):
+        self.in_q = in_q
+        self._buffer = ""
+        self._eof = False
+
+    def _fill_buffer(self):
+        while not self._buffer and not self._eof:
+            msg = self.in_q.get()
+            kind = msg.get("type")
+            if kind == "stdin":
+                self._buffer += msg.get("chunk", "")
+            elif kind == "stdin_eof":
+                self._eof = True
+                break
+
+    def read(self, size=-1):
+        if size == 0:
+            return ""
+        if size < 0:
+            chunks = []
+            while True:
+                self._fill_buffer()
+                if not self._buffer:
+                    break
+                chunks.append(self._buffer)
+                self._buffer = ""
+            return "".join(chunks)
+
+        self._fill_buffer()
+        if not self._buffer:
+            return ""
+        chunk = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return chunk
+
+    def readline(self, size=-1):
+        if size == 0:
+            return ""
+        line = []
+        remaining = size
+        while True:
+            self._fill_buffer()
+            if not self._buffer:
+                break
+            chunk = self._buffer
+            newline_pos = chunk.find("\n")
+            take = len(chunk) if newline_pos == -1 else newline_pos + 1
+            if remaining >= 0:
+                take = min(take, remaining)
+            line.append(chunk[:take])
+            self._buffer = chunk[take:]
+            if (newline_pos != -1 and take == newline_pos + 1) or (remaining >= 0 and take == remaining):
+                if remaining >= 0:
+                    remaining -= take
+                break
+            if remaining >= 0:
+                remaining -= take
+                if remaining <= 0:
+                    break
+        return "".join(line)
+
+    def readable(self):
+        return True
+
+    def close(self):
+        self._eof = True
+
+sys.stdin = _QueueReader(in_queue)
 
 # displayhook: 捕获最后表达式的值
 def _displayhook(value):
@@ -109,6 +180,7 @@ class AsyncInterpreterRunner:
         # 创建子解释器和通信队列
         self.interp = interpreters.create()
         self.out_queue = interpreters.create_queue()  # 子解释器 -> 主解释器
+        self.in_queue = interpreters.create_queue()   # 主解释器 -> 子解释器
 
         # 引导子解释器
         self._bootstrap()
@@ -127,15 +199,19 @@ class AsyncInterpreterRunner:
         self._cell_id = 0
         self._cell_done = asyncio.Event()
         self._last_exc: Optional[str] = None
+        self._worker_thread: Optional[threading.Thread] = None
         self._current_buf: Dict[str, List[str]] = {
             "stdout": [],
             "stderr": [],
             "result": []
         }
+        # 结果存档与当前活动 cell
+        self._results: Dict[int, Dict[str, object]] = {}
+        self._active_cid: Optional[int] = None
 
     def _bootstrap(self):
         """注入引导代码到子解释器"""
-        self.interp.prepare_main(out_queue=self.out_queue)
+        self.interp.prepare_main(out_queue=self.out_queue, in_queue=self.in_queue)
         self.interp.exec(_BOOTSTRAP)
 
     # ---------- 私有方法 ----------
@@ -169,10 +245,23 @@ class AsyncInterpreterRunner:
             # 重置缓冲区
             self._current_buf = {"stdout": [], "stderr": [], "result": []}
             self._last_exc = None
+            self._active_cid = msg.get("cell_id")
         elif msg_type == "cell_end":
             self._last_exc = msg.get("exception")
+            # 存档本次执行的最终输出
+            cid = msg.get("cell_id")
+            out = self.get_current_output()
+            self._results[cid] = {
+                "cell_id": cid,
+                "stdout": out.get("stdout", ""),
+                "stderr": out.get("stderr", ""),
+                "result": out.get("result", ""),
+                "exception": self._last_exc,
+            }
             self._cell_done.set()
             self._running = False
+            self._worker_thread = None
+            self._active_cid = None
         elif msg_type == "cell_rejected":
             pass  # 子解释器拒绝执行
 
@@ -199,6 +288,144 @@ class AsyncInterpreterRunner:
             "result": "".join(self._current_buf["result"]),
         }
 
+    # ---------- 非阻塞执行与结果查询 ----------
+
+    def start_cell(self, source: str) -> int:
+        """
+        非阻塞地启动代码单元执行，立即返回 cell_id。
+
+        异常:
+            BusyError: 正在执行其他代码
+        """
+        if self._running:
+            raise BusyError(f"会话 {self.name} 正在执行 cell {self._cell_id}")
+
+        self._running = True
+        self._cell_done = asyncio.Event()
+        self._cell_id += 1
+        cid = self._cell_id
+
+        # 启动执行线程
+        self._worker_thread = threading.Thread(
+            target=self._exec_cell,
+            args=(cid, source),
+            daemon=True,
+            name=f"{self.name}-cell-{cid}"
+        )
+        self._worker_thread.start()
+        return cid
+
+    async def wait_cell(self, cid: int, timeout: Optional[float] = None) -> Dict[str, object]:
+        """
+        等待指定 cell 完成，返回最终结果。
+
+        - 若已完成，立即返回存档结果。
+        - 若 cid 不是当前活动且不存在存档，则报错。
+        - 若等待超时，抛出 asyncio.TimeoutError。
+        """
+        if cid in self._results:
+            return self._results[cid]
+        if cid != self._active_cid:
+            raise ValueError("指定的 cell_id 不存在或不是当前活动 cell")
+        await asyncio.wait_for(self._cell_done.wait(), timeout=timeout)
+        return self._results.get(cid, {
+            "cell_id": cid,
+            "stdout": "",
+            "stderr": "",
+            "result": "",
+            "exception": "执行结果不可用",
+        })
+
+    def get_cell_snapshot(self, cid: Optional[int] = None) -> Dict[str, object]:
+        """
+        获取指定 cell 的输出快照。
+
+        - 若未传 cid，优先返回当前活动 cell；若无活动 cell 则返回最新完成的一个。
+        - 返回结构包含: cell_id, stdout, stderr, result, exception(若已结束), running(bool), done(bool)
+        """
+        # 已完成直接返回并标注 done
+        if cid is not None and cid in self._results:
+            r = self._results[cid]
+            return {
+                "cell_id": r["cell_id"],
+                "stdout": r["stdout"],
+                "stderr": r["stderr"],
+                "result": r["result"],
+                "exception": r.get("exception"),
+                "running": False,
+                "done": True,
+            }
+
+        # 选择目标 cell
+        target_cid = cid
+        if target_cid is None:
+            if self._active_cid is not None:
+                target_cid = self._active_cid
+            elif self._results:
+                # 返回最近一个完成的（最大 cid）
+                target_cid = max(self._results)
+            else:
+                raise ValueError("没有可用的 cell")
+
+        # 若是当前活动 cell，返回实时快照
+        if target_cid == self._active_cid:
+            out = self.get_current_output()
+            return {
+                "cell_id": target_cid,
+                "stdout": out["stdout"],
+                "stderr": out["stderr"],
+                "result": out["result"],
+                "exception": None,
+                "running": True,
+                "done": False,
+            }
+
+        # 否则尝试返回已完成存档
+        if target_cid in self._results:
+            r = self._results[target_cid]
+            return {
+                "cell_id": r["cell_id"],
+                "stdout": r["stdout"],
+                "stderr": r["stderr"],
+                "result": r["result"],
+                "exception": r.get("exception"),
+                "running": False,
+                "done": True,
+            }
+
+        raise ValueError("指定的 cell_id 不存在")
+
+    def list_cells(self) -> List[Dict[str, object]]:
+        """
+        列出当前会话中所有可用的 cell。
+
+        返回:
+            List[Dict]: 包含所有cell信息的列表，每个元素包含:
+                - cell_id: int
+                - status: str ("running" 或 "completed")
+                - has_exception: bool (是否有异常)
+        """
+        cells = []
+
+        # 添加所有已完成的cell（按cell_id排序）
+        for cid in sorted(self._results.keys()):
+            r = self._results[cid]
+            cells.append({
+                "cell_id": cid,
+                "status": "completed",
+                "has_exception": r.get("exception") is not None,
+            })
+
+        # 添加当前正在运行的cell（如果存在且不在已完成列表中）
+        if self._active_cid is not None and self._active_cid not in self._results:
+            cells.append({
+                "cell_id": self._active_cid,
+                "status": "running",
+                "has_exception": False,
+            })
+
+        return cells
+
     async def run_cell(
         self,
         source: str,
@@ -223,7 +450,13 @@ class AsyncInterpreterRunner:
         cid = self._cell_id
 
         # 触发执行
-        self.interp.exec(f"run_cell({cid}, {source!r})")
+        self._worker_thread = threading.Thread(
+            target=self._exec_cell,
+            args=(cid, source),
+            daemon=True,
+            name=f"{self.name}-cell-{cid}"
+        )
+        self._worker_thread.start()
 
         # 等待完成或超时
         try:
@@ -240,6 +473,50 @@ class AsyncInterpreterRunner:
             "result": out["result"],
             "exception": self._last_exc,
         }
+
+    def _exec_cell(self, cid: int, source: str):
+        try:
+            self.interp.exec(f"run_cell({cid}, {source!r})")
+        except Exception as exc:
+            err = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            msg = {
+                "type": "cell_end",
+                "cell_id": cid,
+                "exception": err,
+                "timing_ms": 0.0,
+                "session": self.name,
+                "synthetic": True,
+            }
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task,
+                self._handle_msg(msg)
+            )
+
+    def send_stdin(self, chunk: str):
+        """写入 stdin 队列"""
+        if not isinstance(chunk, str):
+            raise TypeError("stdin 数据必须为字符串")
+        self.in_queue.put({"type": "stdin", "chunk": chunk})
+
+    def send_stdin_eof(self):
+        """发送 EOF 标记"""
+        self.in_queue.put({"type": "stdin_eof"})
+
+    def cancel_current_cell(self) -> bool:
+        """尝试向执行线程注入 KeyboardInterrupt"""
+        if not self._running or self._worker_thread is None:
+            return False
+        ident = self._worker_thread.ident
+        if ident is None:
+            return False
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(ident),
+            ctypes.py_object(KeyboardInterrupt)
+        )
+        if res > 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+            raise RuntimeError("取消执行失败")
+        return res == 1
 
     def subscribe_events(self) -> asyncio.Queue:
         """
