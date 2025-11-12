@@ -133,18 +133,40 @@ _GLOBALS = {"__name__": "__main__", "__package__": None}
 # 单次执行保护
 _RUNNING = False
 
+# 取消标志
+_CANCEL_REQUESTED = False
+
+def _check_cancel():
+    global _CANCEL_REQUESTED
+    # 非阻塞地检查 in_queue 中的取消消息
+    try:
+        while True:
+            msg = in_queue.get(block=False, timeout=0)
+            if msg.get("type") == "cancel":
+                _CANCEL_REQUESTED = True
+                break
+    except:
+        pass  # 队列为空或超时
+
+    if _CANCEL_REQUESTED:
+        raise KeyboardInterrupt("执行已被取消")
+
 def run_cell(cell_id, source):
-    global _RUNNING
+    global _RUNNING, _CANCEL_REQUESTED
     if _RUNNING:
         out_queue.put({"type": "cell_rejected", "cell_id": cell_id, "reason": "busy"})
         return
 
     _RUNNING = True
+    _CANCEL_REQUESTED = False  # 重置取消标志
     out_queue.put({"type": "cell_start", "cell_id": cell_id})
     t0 = time.perf_counter()
     exc = None
 
     try:
+        # 执行前检查取消
+        _check_cancel()
+
         # 尝试用 "single" 模式编译(单语句/表达式)
         try:
             code = compile(source, "<cell>", "single")
@@ -152,7 +174,17 @@ def run_cell(cell_id, source):
             # 多语句情况:使用 "exec" 模式
             code = compile(source, "<cell>", "exec")
 
-        exec(code, _GLOBALS, _GLOBALS)
+        # 设置 trace 函数以便在执行过程中检查取消
+        def _trace_cancel(frame, event, arg):
+            _check_cancel()
+            return _trace_cancel
+
+        sys.settrace(_trace_cancel)
+        try:
+            exec(code, _GLOBALS, _GLOBALS)
+        finally:
+            sys.settrace(None)
+
     except BaseException as e:
         exc = "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
@@ -164,6 +196,7 @@ def run_cell(cell_id, source):
         "timing_ms": round(dt, 3)
     })
     _RUNNING = False
+    _CANCEL_REQUESTED = False
 """
 
 
@@ -503,12 +536,28 @@ class AsyncInterpreterRunner:
         self.in_queue.put({"type": "stdin_eof"})
 
     def cancel_current_cell(self) -> bool:
-        """尝试向执行线程注入 KeyboardInterrupt"""
+        """
+        通过消息通道向子解释器发送取消信号。
+
+        首先尝试通过 in_queue 发送取消消息，让子解释器主动响应。
+        如果子解释器支持，这是最可靠的方式。
+
+        作为后备方案，同时向执行线程注入 KeyboardInterrupt。
+        """
         if not self._running or self._worker_thread is None:
             return False
+
+        # 方法1: 通过消息队列发送取消信号（推荐方式）
+        try:
+            self.in_queue.put({"type": "cancel"})
+        except Exception:
+            pass  # 队列可能已满或不可用
+
+        # 方法2: 向执行线程注入异常（后备方案）
         ident = self._worker_thread.ident
         if ident is None:
             return False
+
         res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
             ctypes.c_ulong(ident),
             ctypes.py_object(KeyboardInterrupt)
@@ -516,7 +565,8 @@ class AsyncInterpreterRunner:
         if res > 1:
             ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
             raise RuntimeError("取消执行失败")
-        return res == 1
+
+        return True  # 已发送取消信号（至少一种方式）
 
     def subscribe_events(self) -> asyncio.Queue:
         """

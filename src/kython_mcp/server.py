@@ -14,6 +14,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kython_mcp.interpreter_runner import AsyncInterpreterRunner, BusyError
 
 
+def _precheck_syntax(code: str) -> None:
+    """在主进程侧进行语法预检，确保尽早失败。
+
+    策略与子解释器保持一致：优先尝试 "single"，失败再尝试 "exec"。
+    若两者均失败，抛出包含行列与上下文的 ValueError。
+    """
+    if not isinstance(code, str):
+        raise ValueError("code 必须为字符串")
+    # 允许空字符串/空白：不视为语法错误
+    try:
+        compile(code, "<mcp-client-code>", "single")
+        return
+    except SyntaxError:
+        pass
+    try:
+        compile(code, "<mcp-client-code>", "exec")
+    except SyntaxError as e:
+        text = e.text or ""
+        where = f"第 {e.lineno} 行, 第 {e.offset} 列" if e.lineno else "未知位置"
+        msg = f"语法错误: {e.msg} ({where})\n{text}"
+        raise ValueError(msg) from e
+
+
 class RunCellResult(BaseModel):
     cell_id: int = Field(description="执行的 cell 序号")
     stdout: str = Field(description="标准输出内容")
@@ -102,6 +125,9 @@ async def run_python_cell(
     if ctx is None:
         raise ValueError("Context 注入失败")
 
+    # 语法预检：发现语法问题直接返回错误
+    _precheck_syntax(code)
+
     runner = await session_store.get_runner(ctx)
 
     try:
@@ -128,6 +154,10 @@ async def start_python_cell(
 ) -> StartCellResult:
     if ctx is None:
         raise ValueError("Context 注入失败")
+
+    # 语法预检：发现语法问题直接返回错误
+    _precheck_syntax(code)
+
     runner = await session_store.get_runner(ctx)
     try:
         cid = runner.start_cell(code)
