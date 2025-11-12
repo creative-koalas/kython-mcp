@@ -5,17 +5,20 @@ LLM-REPL Agent - 将大模型与Python REPL结合的自主编码代理
 """
 
 import asyncio
-from pathlib import Path
-from typing import List, Dict, Optional
-import sys
 import json
+from pathlib import Path
+from typing import Dict, List, Optional
+import sys
 
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
 
-from src.kython_mcp.interpreter_runner import AsyncInterpreterRunner, BusyError
-from src.llm_backend import OpenAICompatibleBackend, Message, LLMResponse
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from kython_mcp.interpreter_runner import AsyncInterpreterRunner, BusyError  # type: ignore
+
+from llm_backend import (  # type: ignore
+    LLMResponse,
+    Message,
+    OpenAICompatibleBackend,
+)
 
 
 class LLMREPLAgent:
