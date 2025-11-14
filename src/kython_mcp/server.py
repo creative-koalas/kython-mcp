@@ -6,12 +6,7 @@ from typing import Annotated, Dict
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
-import sys
-import os
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kython_mcp.interpreter_runner import AsyncInterpreterRunner, BusyError
+from .interpreter_runner import AsyncInterpreterRunner, BusyError
 
 
 def _precheck_syntax(code: str) -> None:
@@ -317,15 +312,4 @@ async def list_python_cells(ctx: Context | None = None) -> list[CellInfo]:
     ]
 
 
-async def _shutdown():
-    await session_store.close_all()
-
-
-def main() -> None:
-    try:
-        server.run(transport="stdio")
-    finally:
-        asyncio.run(_shutdown())
-
-
-__all__ = ["main", "server"]
+__all__ = ["server"]
