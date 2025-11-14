@@ -10,6 +10,7 @@ wheels/
 *.egg-info
 olds/
 test/
+logs/
 
 # Virtual environments
 .venv

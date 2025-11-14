@@ -7,6 +7,9 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from .interpreter_runner import AsyncInterpreterRunner, BusyError
+from .local_log import get_logger, get_session_logger
+
+logger = get_logger("kython_mcp.server")
 
 
 def _precheck_syntax(code: str) -> None:
@@ -66,6 +69,7 @@ class InterpreterSessionStore:
 
     def __init__(self):
         self._runners: Dict[int, AsyncInterpreterRunner] = {}
+        self._session_loggers: Dict[int, object] = {}
         self._lock = asyncio.Lock()
 
     async def get_runner(self, ctx: Context) -> AsyncInterpreterRunner:
@@ -81,19 +85,34 @@ class InterpreterSessionStore:
                 session_name = ctx.client_id or f"session-{key}"
                 runner = AsyncInterpreterRunner(name=session_name, loop=loop)
                 self._runners[key] = runner
+                self._session_loggers[key] = get_session_logger(session_name)
+                logger.info("create_runner session_key=%s session_name=%s", key, session_name)
             return runner
 
     async def reset_runner(self, ctx: Context) -> None:
         key = self._session_key(ctx)
         runner = self._runners.pop(key, None)
         if runner is not None:
+            logger.info("reset_runner session_key=%s", key)
             await runner.aclose()
+        # 清理会话日志记录器引用（文件句柄由 logging 管理）
+        self._session_loggers.pop(key, None)
 
     async def close_all(self) -> None:
         runners = list(self._runners.values())
         self._runners.clear()
         for runner in runners:
             await runner.aclose()
+        logger.info("close_all_runners count=%d", len(runners))
+
+    async def get_session_logger(self, ctx: Context):
+        key = self._session_key(ctx)
+        logger_sess = self._session_loggers.get(key)
+        if logger_sess is not None:
+            return logger_sess
+        # 若不存在则确保 runner 创建，同时绑定会话 logger
+        await self.get_runner(ctx)
+        return self._session_loggers[self._session_key(ctx)]
 
     @staticmethod
     def _session_key(ctx: Context) -> int:
@@ -132,12 +151,32 @@ async def run_python_cell(
     _precheck_syntax(code)
 
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
+    slog = await session_store.get_session_logger(ctx)
+    slog = await session_store.get_session_logger(ctx)
 
     try:
+        logger.info("run_python_cell start client=%s", ctx.client_id)
+        slog.info("调用 run_python_cell, 代码长度=%d, 超时=%s\n代码:\n%s", len(code or ""), timeout, code)
         result = await runner.run_cell(code, timeout=timeout)
     except BusyError as exc:
+        logger.warning("run_python_cell busy client=%s", ctx.client_id)
+        slog.warning("run_python_cell 忙，拒绝执行")
         raise RuntimeError(f"当前会话正在执行其他代码: {exc}") from exc
+    except Exception:
+        logger.exception("run_python_cell error client=%s", ctx.client_id)
+        slog.exception("run_python_cell 执行异常")
+        raise
 
+    logger.info("run_python_cell done client=%s cid=%s", ctx.client_id, result["cell_id"]) 
+    slog.info(
+        "run_python_cell 完成 cid=%s, 有异常=%s, stdout_len=%d, stderr_len=%d, result_len=%d",
+        result["cell_id"],
+        result.get("exception") is not None,
+        len(result.get("stdout", "")),
+        len(result.get("stderr", "")),
+        len(result.get("result", "")),
+    )
     return RunCellResult(
         cell_id=result["cell_id"],
         stdout=result["stdout"],
@@ -162,10 +201,21 @@ async def start_python_cell(
     _precheck_syntax(code)
 
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
     try:
+        logger.info("start_python_cell start client=%s", ctx.client_id)
+        slog.info("调用 start_python_cell, 代码长度=%d\n代码:\n%s", len(code or ""), code)
         cid = runner.start_cell(code)
     except BusyError as exc:
+        logger.warning("start_python_cell busy client=%s", ctx.client_id)
+        slog.warning("start_python_cell 忙，拒绝执行")
         raise RuntimeError(f"当前会话正在执行其他代码: {exc}") from exc
+    except Exception:
+        logger.exception("start_python_cell error client=%s", ctx.client_id)
+        slog.exception("start_python_cell 异常")
+        raise
+    logger.info("start_python_cell done client=%s cid=%s", ctx.client_id, cid)
+    slog.info("start_python_cell 已启动 cid=%s", cid)
     return StartCellResult(cell_id=cid, status="started")
 
 
@@ -180,7 +230,16 @@ async def get_python_cell_snapshot(
     if ctx is None:
         raise ValueError("Context 注入失败")
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
     snap = runner.get_cell_snapshot(cell_id)
+    logger.info(
+        "get_python_cell_snapshot client=%s cid=%s running=%s done=%s",
+        ctx.client_id,
+        snap["cell_id"],
+        snap["running"],
+        snap["done"],
+    )
+    slog.info("调用 get_python_cell_snapshot cid=%s, running=%s, done=%s", snap["cell_id"], snap["running"], snap["done"])
     return CellSnapshot(
         cell_id=snap["cell_id"],
         stdout=snap["stdout"],
@@ -204,11 +263,18 @@ async def wait_python_cell(
     if ctx is None:
         raise ValueError("Context 注入失败")
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
 
     # 若未指定，则选用当前活动或最近完成者
     if cell_id is None:
         snap0 = runner.get_cell_snapshot(None)
         if snap0.get("done"):
+            logger.info(
+                "wait_python_cell shortcut_done client=%s cid=%s",
+                ctx.client_id,
+                snap0["cell_id"],
+            )
+            slog.info("wait_python_cell 直接返回已完成快照 cid=%s", snap0["cell_id"])
             return CellSnapshot(
                 cell_id=snap0["cell_id"],
                 stdout=snap0["stdout"],
@@ -221,7 +287,11 @@ async def wait_python_cell(
         cell_id = snap0["cell_id"]
 
     try:
+        logger.info("wait_python_cell start client=%s cid=%s", ctx.client_id, cell_id)
+        slog.info("调用 wait_python_cell cid=%s, 超时=%s", cell_id, timeout)
         res = await runner.wait_cell(cell_id, timeout=timeout)
+        logger.info("wait_python_cell done client=%s cid=%s", ctx.client_id, res["cell_id"]) 
+        slog.info("wait_python_cell 完成 cid=%s, 有异常=%s", res["cell_id"], res.get("exception") is not None)
         return CellSnapshot(
             cell_id=res["cell_id"],
             stdout=res["stdout"],
@@ -233,6 +303,12 @@ async def wait_python_cell(
         )
     except asyncio.TimeoutError:
         snap = runner.get_cell_snapshot(cell_id)
+        logger.info(
+            "wait_python_cell timeout client=%s cid=%s",
+            ctx.client_id,
+            cell_id,
+        )
+        slog.info("wait_python_cell 超时 cid=%s，返回当前快照", cell_id)
         return CellSnapshot(
             cell_id=snap["cell_id"],
             stdout=snap["stdout"],
@@ -252,7 +328,10 @@ async def reset_python_session(ctx: Context | None = None) -> str:
     if ctx is None:
         raise ValueError("Context 注入失败")
 
+    slog = await session_store.get_session_logger(ctx)
+    slog.info("reset_python_session 重置会话解释器")
     await session_store.reset_runner(ctx)
+    logger.info("reset_python_session client=%s", ctx.client_id)
     return "已重置当前会话的 Python 子解释器。"
 
 
@@ -270,6 +349,7 @@ async def send_python_stdin(
         raise ValueError("Context 注入失败")
 
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
 
     data = chunk or ""
     if data or append_newline:
@@ -279,7 +359,20 @@ async def send_python_stdin(
 
     if send_eof:
         runner.send_stdin_eof()
-
+    logger.info(
+        "send_python_stdin client=%s len=%d newline=%s eof=%s",
+        ctx.client_id,
+        len(chunk or ""),
+        append_newline,
+        send_eof,
+    )
+    slog.info(
+        "调用 send_python_stdin, 数据长度=%d, 追加换行=%s, EOF=%s\n数据:\n%s",
+        len(chunk or ""),
+        append_newline,
+        send_eof,
+        chunk or "",
+    )
     return "stdin 写入完成。"
 
 
@@ -292,10 +385,15 @@ async def cancel_python_cell(ctx: Context | None = None) -> str:
         raise ValueError("Context 注入失败")
 
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
     if not runner.is_running:
+        logger.info("cancel_python_cell no_running client=%s", ctx.client_id)
+        slog.info("cancel_python_cell 当前无运行任务")
         return "当前没有正在执行的代码。"
 
     success = runner.cancel_current_cell()
+    logger.info("cancel_python_cell client=%s success=%s", ctx.client_id, success)
+    slog.info("cancel_python_cell 已发送中断信号, 成功=%s", success)
     return "已发送中断信号。" if success else "中断失败，请稍后重试。"
 
 
@@ -308,7 +406,10 @@ async def list_python_cells(ctx: Context | None = None) -> list[CellInfo]:
         raise ValueError("Context 注入失败")
 
     runner = await session_store.get_runner(ctx)
+    slog = await session_store.get_session_logger(ctx)
     cells = runner.list_cells()
+    logger.info("list_python_cells client=%s count=%d", ctx.client_id, len(cells))
+    slog.info("调用 list_python_cells, 总数=%d", len(cells))
 
     return [
         CellInfo(
