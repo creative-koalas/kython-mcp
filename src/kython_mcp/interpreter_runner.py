@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 from typing import Dict, List, Optional
+from dataclasses import dataclass
 
 from concurrent import interpreters
 
@@ -242,6 +243,12 @@ class AsyncInterpreterRunner:
         self._results: Dict[int, Dict[str, object]] = {}
         self._active_cid: Optional[int] = None
 
+    @dataclass(frozen=True)
+    class OutputSnapshot:
+        stdout: str
+        stderr: str
+        result: str
+
     def _bootstrap(self):
         """注入引导代码到子解释器"""
         self.interp.prepare_main(out_queue=self.out_queue, in_queue=self.in_queue)
@@ -286,9 +293,9 @@ class AsyncInterpreterRunner:
             out = self.get_current_output()
             self._results[cid] = {
                 "cell_id": cid,
-                "stdout": out.get("stdout", ""),
-                "stderr": out.get("stderr", ""),
-                "result": out.get("result", ""),
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "result": out.result,
                 "exception": self._last_exc,
             }
             self._cell_done.set()
@@ -313,13 +320,13 @@ class AsyncInterpreterRunner:
         """检查是否正在执行"""
         return self._running
 
-    def get_current_output(self) -> Dict[str, str]:
+    def get_current_output(self) -> "AsyncInterpreterRunner.OutputSnapshot":
         """获取当前 cell 的输出快照"""
-        return {
-            "stdout": "".join(self._current_buf["stdout"]),
-            "stderr": "".join(self._current_buf["stderr"]),
-            "result": "".join(self._current_buf["result"]),
-        }
+        return AsyncInterpreterRunner.OutputSnapshot(
+            stdout="".join(self._current_buf["stdout"]),
+            stderr="".join(self._current_buf["stderr"]),
+            result="".join(self._current_buf["result"]),
+        )
 
     # ---------- 非阻塞执行与结果查询 ----------
 
@@ -405,9 +412,9 @@ class AsyncInterpreterRunner:
             out = self.get_current_output()
             return {
                 "cell_id": target_cid,
-                "stdout": out["stdout"],
-                "stderr": out["stderr"],
-                "result": out["result"],
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "result": out.result,
                 "exception": None,
                 "running": True,
                 "done": False,
@@ -501,9 +508,9 @@ class AsyncInterpreterRunner:
         out = self.get_current_output()
         return {
             "cell_id": cid,
-            "stdout": out["stdout"],
-            "stderr": out["stderr"],
-            "result": out["result"],
+            "stdout": out.stdout,
+            "stderr": out.stderr,
+            "result": out.result,
             "exception": self._last_exc,
         }
 

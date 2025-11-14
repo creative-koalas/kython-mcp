@@ -108,6 +108,14 @@ server = FastMCP(
 )
 
 
+def main() -> None:
+    """以 stdio 传输启动 MCP Server，并在退出时关闭所有会话。"""
+    try:
+        server.run(transport="stdio")
+    finally:
+        asyncio.run(session_store.close_all())
+
+
 @server.tool(
     name="run_python_cell",
     description="执行任意 Python 代码，并返回 stdout/stderr/displayhook/异常信息。会话内变量会被复用。",
@@ -312,4 +320,8 @@ async def list_python_cells(ctx: Context | None = None) -> list[CellInfo]:
     ]
 
 
-__all__ = ["server"]
+__all__ = ["server", "main"]
+
+
+if __name__ == "__main__":
+    main()

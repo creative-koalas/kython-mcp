@@ -1,14 +1,6 @@
-import asyncio
-
-from .server import server, session_store
+from .server import main
 
 
-async def _shutdown():
-    await session_store.close_all()
-
-
-def main() -> None:
-    try:
-        server.run(transport="stdio")
-    finally:
-        asyncio.run(_shutdown())
+if __name__ == "__main__":
+    print("Starting kython_mcp server...")
+    main()
