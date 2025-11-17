@@ -139,10 +139,10 @@ _CANCEL_REQUESTED = False
 
 def _check_cancel():
     global _CANCEL_REQUESTED
-    # 非阻塞地检查 in_queue 中的取消消息
+    # 非阻塞地检查 cancel_queue 中的取消消息
     try:
         while True:
-            msg = in_queue.get(block=False, timeout=0)
+            msg = cancel_queue.get(block=False, timeout=0)
             if msg.get("type") == "cancel":
                 _CANCEL_REQUESTED = True
                 break
@@ -215,6 +215,7 @@ class AsyncInterpreterRunner:
         self.interp = interpreters.create()
         self.out_queue = interpreters.create_queue()  # 子解释器 -> 主解释器
         self.in_queue = interpreters.create_queue()   # 主解释器 -> 子解释器
+        self.cancel_queue = interpreters.create_queue()  # 主解释器 -> 子解释器(取消信号)
 
         # 引导子解释器
         self._bootstrap()
@@ -251,24 +252,46 @@ class AsyncInterpreterRunner:
 
     def _bootstrap(self):
         """注入引导代码到子解释器"""
-        self.interp.prepare_main(out_queue=self.out_queue, in_queue=self.in_queue)
+        self.interp.prepare_main(
+            out_queue=self.out_queue,
+            in_queue=self.in_queue,
+            cancel_queue=self.cancel_queue,
+        )
         self.interp.exec(_BOOTSTRAP)
 
     # ---------- 私有方法 ----------
 
     def _reader_loop(self):
         """阻塞读取线程，将队列消息转发到 asyncio"""
-        while not self._stop:
+        while True:
+            if self._stop:
+                break
             try:
-                msg = self.out_queue.get(timeout=0.1)  # 字典消息
-                msg["session"] = self.name
-                # 调度到事件循环
-                self._loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self._handle_msg(msg)
-                )
-            except:
+                msg = self.out_queue.get()  # 阻塞等待，避免自旋占用 CPU
+            except Exception:
+                if self._stop:
+                    break
                 continue
+
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "__stop__":
+                break
+
+            msg["session"] = self.name
+            # 调度到事件循环
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task,
+                self._handle_msg(msg)
+            )
+
+    def _request_reader_stop(self):
+        """向读取线程发出停止信号"""
+        self._stop = True
+        try:
+            self.out_queue.put({"type": "__stop__"}, block=False)
+        except Exception:
+            pass
 
     async def _handle_msg(self, msg: dict):
         """处理来自子解释器的消息"""
@@ -556,7 +579,7 @@ class AsyncInterpreterRunner:
 
         # 方法1: 通过消息队列发送取消信号（推荐方式）
         try:
-            self.in_queue.put({"type": "cancel"})
+            self.cancel_queue.put({"type": "cancel"})
         except Exception:
             pass  # 队列可能已满或不可用
 
@@ -593,7 +616,15 @@ class AsyncInterpreterRunner:
 
     async def aclose(self):
         """关闭会话"""
-        self._stop = True
+        self._request_reader_stop()
+        if self._reader.is_alive():
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._reader.join),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, RuntimeError):
+                pass
         try:
             self.interp.close()
         except:
@@ -601,7 +632,12 @@ class AsyncInterpreterRunner:
 
     def close(self):
         """同步关闭"""
-        self._stop = True
+        self._request_reader_stop()
+        if self._reader.is_alive():
+            try:
+                self._reader.join(timeout=1.0)
+            except RuntimeError:
+                pass
         try:
             self.interp.close()
         except:

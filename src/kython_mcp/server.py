@@ -52,11 +52,7 @@ def _escape_attr(value: str | None) -> str:
 def _escape_text(value: str | None) -> str:
     if value is None:
         return ""
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 class StartCellResult(BaseModel):
@@ -111,14 +107,16 @@ class InterpreterSessionStore:
         self._ctx_public_counter: Dict[int, int] = {}
         self._lock = asyncio.Lock()
 
-    async def create_session(self, ctx: Context, name: str | None = None) -> Tuple[str, _SessionRecord]:
+    async def create_session(
+        self, ctx: Context, name: str | None = None
+    ) -> Tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
             session_id = uuid.uuid4().hex
             counter = self._ctx_public_counter.get(key, 0) + 1
             self._ctx_public_counter[key] = counter
             public_id = str(counter)
-            session_name = name or str(public_id)
+            session_name = name or f"session-{public_id}"
             loop = asyncio.get_running_loop()
             runner = AsyncInterpreterRunner(name=session_name, loop=loop)
             record = _SessionRecord(
@@ -150,7 +148,9 @@ class InterpreterSessionStore:
             ]
         return records
 
-    async def get_session(self, ctx: Context, session_id: str) -> Tuple[str, _SessionRecord]:
+    async def get_session(
+        self, ctx: Context, session_id: str
+    ) -> Tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
             internal_id = self._resolve_internal_id_locked(key, session_id)
@@ -161,7 +161,9 @@ class InterpreterSessionStore:
             raise ValueError("session 不属于当前 MCP 会话")
         return internal_id, record
 
-    async def reset_session(self, ctx: Context, session_id: str) -> Tuple[str, _SessionRecord]:
+    async def reset_session(
+        self, ctx: Context, session_id: str
+    ) -> Tuple[str, _SessionRecord]:
         internal_id, record = await self.get_session(ctx, session_id)
         loop = asyncio.get_running_loop()
         new_runner = AsyncInterpreterRunner(name=record.name, loop=loop)
@@ -175,7 +177,9 @@ class InterpreterSessionStore:
         )
         async with self._lock:
             self._sessions[internal_id] = new_record
-        logger.info("reset_session session_id=%s ctx_key=%s", internal_id, record.ctx_key)
+        logger.info(
+            "reset_session session_id=%s ctx_key=%s", internal_id, record.ctx_key
+        )
         return internal_id, new_record
 
     async def close_session(self, ctx: Context, session_id: str) -> Tuple[str, str]:
@@ -239,16 +243,22 @@ def main() -> None:
     description="创建一个新的 Python 子解释器 session，并返回 session_id。",
 )
 async def create_python_session(
-    name: Annotated[str | None, Field(description="可选自定义 session 名称")]=None,
+    name: Annotated[str | None, Field(description="可选自定义 session 名称")] = None,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
         raise ValueError("Context 注入失败")
 
     internal_id, record = await session_store.create_session(ctx, name=name)
-    record.logger.info("create_python_session name=%s session_id=%s", record.name, internal_id)
-    logger.info("create_python_session client=%s session_id=%s", ctx.client_id, internal_id)
-    payload = f'<session id="{_escape_attr(record.public_id)}" name="{_escape_attr(record.name)}" status="created"/>'
+    record.logger.info(
+        "create_python_session name=%s session_id=%s", record.name, internal_id
+    )
+    logger.info(
+        "create_python_session client=%s session_id=%s", ctx.client_id, internal_id
+    )
+    payload = (
+        f"New Python session created. Session ID:{record.public_id} Name:{record.name}."
+    )
     return payload
 
 
@@ -263,10 +273,16 @@ async def list_python_sessions(ctx: Context | None = None) -> str:
     sessions = await session_store.list_sessions(ctx)
     logger.info("list_python_sessions client=%s count=%d", ctx.client_id, len(sessions))
     items = "".join(
-        f'<session id="{_escape_attr(sid)}" name="{_escape_attr(record.name)}" run="{int(record.runner.is_running)}"/>'
+        f"""- id: '{record.public_id}'
+  metadata:
+    name: '{_escape_attr(record.name)}'
+    running: {record.runner.is_running}"""
         for sid, record in sessions
     )
-    return f"<sessions>{items}</sessions>"
+    return f"""Current active zsh sessions:
+<sessions>
+{items}
+</sessions>"""
 
 
 @server.tool(
@@ -282,7 +298,7 @@ async def close_python_session(
 
     internal_id, public_id = await session_store.close_session(ctx, session_id)
     logger.info("close_python_session client=%s session=%s", ctx.client_id, internal_id)
-    payload = f'<session id="{_escape_attr(public_id)}" status="closed"/>'
+    payload = f"Python session closed. Session ID: {public_id}."
     return payload
 
 
@@ -305,21 +321,37 @@ async def start_python_cell(
     runner = record.runner
     slog = record.logger
     try:
-        logger.info("start_python_cell start client=%s session=%s", ctx.client_id, internal_id)
-        slog.info("调用 start_python_cell, 代码长度=%d\n代码:\n%s", len(code or ""), code)
+        logger.info(
+            "start_python_cell start client=%s session=%s", ctx.client_id, internal_id
+        )
+        slog.info(
+            "调用 start_python_cell, 代码长度=%d\n代码:\n%s", len(code or ""), code
+        )
         cid = runner.start_cell(code)
     except BusyError as exc:
-        logger.warning("start_python_cell busy client=%s session=%s", ctx.client_id, internal_id)
+        logger.warning(
+            "start_python_cell busy client=%s session=%s", ctx.client_id, internal_id
+        )
         slog.warning("start_python_cell 忙，拒绝执行")
         raise RuntimeError(f"当前会话正在执行其他代码: {exc}") from exc
     except Exception:
-        logger.exception("start_python_cell error client=%s session=%s", ctx.client_id, internal_id)
+        logger.exception(
+            "start_python_cell error client=%s session=%s", ctx.client_id, internal_id
+        )
         slog.exception("start_python_cell 异常")
         raise
-    logger.info("start_python_cell done client=%s session=%s cid=%s", ctx.client_id, internal_id, cid)
+    logger.info(
+        "start_python_cell done client=%s session=%s cid=%s",
+        ctx.client_id,
+        internal_id,
+        cid,
+    )
     slog.info("start_python_cell 已启动 cid=%s", cid)
     payload = (
-        f'<cell session="{_escape_attr(record.public_id)}" id="{cid}" status="started"/>'
+        "Python cell started.\n"
+        f"Session ID: {record.public_id}\n"
+        f"Cell ID: {cid}\n"
+        "Status: started"
     )
     return payload
 
@@ -330,7 +362,12 @@ async def start_python_cell(
 )
 async def get_python_cell_snapshot(
     session_id: Annotated[str, Field(description="要查询的 session ID")],
-    cell_id: Annotated[int | None, Field(description="可选指定 cell_id；为空则优先返回当前活动 cell，否则返回最近完成者")]=None,
+    cell_id: Annotated[
+        int | None,
+        Field(
+            description="可选指定 cell_id；为空则优先返回当前活动 cell，否则返回最近完成者"
+        ),
+    ] = None,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
@@ -347,16 +384,32 @@ async def get_python_cell_snapshot(
         snap["running"],
         snap["done"],
     )
-    slog.info("调用 get_python_cell_snapshot cid=%s, running=%s, done=%s", snap["cell_id"], snap["running"], snap["done"])
-    stdout_block = f"<stdout>{_escape_text(snap['stdout'])}</stdout>"
-    stderr_block = f"<stderr>{_escape_text(snap['stderr'])}</stderr>"
-    result_block = f"<result>{_escape_text(snap['result'])}</result>"
-    exception = snap.get("exception")
-    exception_block = f"<exception>{_escape_text(exception)}</exception>" if exception else ""
-    payload = (
-        f'<cell session="{_escape_attr(record.public_id)}" id="{snap["cell_id"]}" run="{int(snap["running"])}" done="{int(snap["done"])}">'
-        f"{stdout_block}{stderr_block}{result_block}{exception_block}</cell>"
+    slog.info(
+        "调用 get_python_cell_snapshot cid=%s, running=%s, done=%s",
+        snap["cell_id"],
+        snap["running"],
+        snap["done"],
     )
+    stdout_text = snap.get("stdout") or ""
+    stderr_text = snap.get("stderr") or ""
+    result_text = snap.get("result") or ""
+    exception = snap.get("exception") or ""
+    lines = [
+        "Python cell snapshot.",
+        f"Session ID: {record.public_id}",
+        f"Cell ID: {snap['cell_id']}",
+        f"Running: {int(snap['running'])}",
+        f"Done: {int(snap['done'])}",
+        "STDOUT:",
+        stdout_text,
+        "STDERR:",
+        stderr_text,
+        "RESULT:",
+        result_text,
+    ]
+    if exception:
+        lines.extend(["EXCEPTION:", exception])
+    payload = "\n".join(lines)
     return payload
 
 
@@ -374,7 +427,7 @@ async def reset_python_session(
     internal_id, record = await session_store.reset_session(ctx, session_id)
     record.logger.info("reset_python_session 重置 session=%s", internal_id)
     logger.info("reset_python_session client=%s session=%s", ctx.client_id, internal_id)
-    payload = f'<session id="{_escape_attr(record.public_id)}" status="reset"/>'
+    payload = f"Python session reset. Session ID: {record.public_id}."
     return payload
 
 
@@ -384,7 +437,9 @@ async def reset_python_session(
 )
 async def send_python_stdin(
     session_id: Annotated[str, Field(description="目标 session ID")],
-    chunk: Annotated[str | None, Field(description="要写入的内容，可为空字符串")] = None,
+    chunk: Annotated[
+        str | None, Field(description="要写入的内容，可为空字符串")
+    ] = None,
     append_newline: Annotated[bool, Field(description="写入后自动追加换行符")] = True,
     send_eof: Annotated[bool, Field(description="是否在写入后发送 EOF")] = False,
     ctx: Context | None = None,
@@ -420,7 +475,11 @@ async def send_python_stdin(
         chunk or "",
     )
     payload = (
-        f'<session id="{_escape_attr(record.public_id)}" action="stdin" newline="{int(append_newline)}" eof="{int(send_eof)}" status="ok"/>'
+        "stdin chunk delivered.\n"
+        f"Session ID: {record.public_id}\n"
+        f"Payload length: {len(chunk or '')}\n"
+        f"Append newline: {append_newline}\n"
+        f"EOF sent: {send_eof}"
     )
     return payload
 
@@ -440,15 +499,32 @@ async def cancel_python_cell(
     runner = record.runner
     slog = record.logger
     if not runner.is_running:
-        logger.info("cancel_python_cell no_running client=%s session=%s", ctx.client_id, internal_id)
+        logger.info(
+            "cancel_python_cell no_running client=%s session=%s",
+            ctx.client_id,
+            internal_id,
+        )
         slog.info("cancel_python_cell 当前无运行任务")
-        payload = f'<session id="{_escape_attr(record.public_id)}" action="cancel" state="idle"/>'
+        payload = (
+            "cancel request ignored.\n"
+            f"Session ID: {record.public_id}\n"
+            "State: idle"
+        )
         return payload
 
     success = runner.cancel_current_cell()
-    logger.info("cancel_python_cell client=%s session=%s success=%s", ctx.client_id, internal_id, success)
+    logger.info(
+        "cancel_python_cell client=%s session=%s success=%s",
+        ctx.client_id,
+        internal_id,
+        success,
+    )
     slog.info("cancel_python_cell 已发送中断信号, 成功=%s", success)
-    payload = f'<session id="{_escape_attr(record.public_id)}" action="cancel" success="{int(success)}"/>'
+    payload = (
+        "cancel request processed.\n"
+        f"Session ID: {record.public_id}\n"
+        f"Interrupt acknowledged: {success}"
+    )
     return payload
 
 
@@ -467,14 +543,27 @@ async def list_python_cells(
     runner = record.runner
     slog = record.logger
     cells = runner.list_cells()
-    logger.info("list_python_cells client=%s session=%s count=%d", ctx.client_id, internal_id, len(cells))
+    logger.info(
+        "list_python_cells client=%s session=%s count=%d",
+        ctx.client_id,
+        internal_id,
+        len(cells),
+    )
     slog.info("调用 list_python_cells, 总数=%d", len(cells))
 
-    items = "".join(
-        f'<cell id="{cell["cell_id"]}" status="{_escape_attr(cell["status"])}" ex="{int(cell["has_exception"])}"/>'
-        for cell in cells
+    entries = []
+    for cell in cells:
+        entries.append(
+            f"- Cell {cell['cell_id']}: status={cell['status']}, has_exception={bool(cell['has_exception'])}"
+        )
+    summary = "\n".join(entries) if entries else "No cells recorded."
+    payload = (
+        "Python cells overview.\n"
+        f"Session ID: {record.public_id}\n"
+        f"Total: {len(cells)}\n"
+        f"{summary}"
     )
-    return f"<cells>{items}</cells>"
+    return payload
 
 
 __all__ = ["server", "main"]
