@@ -39,7 +39,13 @@ def _precheck_syntax(code: str) -> None:
 
 
 def _dump_yaml(data: object) -> str:
-    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, indent=2)
+    dumped = yaml.dump(
+        data,
+        allow_unicode=True,
+        sort_keys=False,
+        indent=2,
+    )
+    return dumped.replace("\n\n", "\n")
 
 
 class StartCellResult(BaseModel):
@@ -50,12 +56,12 @@ class StartCellResult(BaseModel):
 
 class CreateSessionResult(BaseModel):
     session_id: str = Field(description="新建 session 的唯一 ID")
-    name: str = Field(description="session 的显示名称")
+    description: str | None = Field(description="session 的描述信息")
 
 
 class PythonSessionInfo(BaseModel):
     session_id: str = Field(description="session ID")
-    name: str = Field(description="session 的显示名称")
+    description: str | None = Field(description="session 的描述信息")
     running: bool = Field(description="是否有代码正在运行")
 
 
@@ -81,16 +87,25 @@ class _SessionRecord:
     logger: object
     ctx_key: int
     public_id: str
+    description: str | None = None
 
 
 def _session_payload(record: _SessionRecord) -> Dict[str, Any]:
-    return {"sid": record.public_id, "run": record.runner.is_running}
+    return {
+        "id": record.public_id,
+        "metadata": {
+            "description": record.description,
+            "running": record.runner.is_running,
+        },
+    }
 
 
-def _tool_response(action: str, **payload: Any) -> str:
-    data: Dict[str, Any] = {"action": action}
-    data.update(payload)
-    return _dump_yaml(data)
+def _format_blocks(blocks: List[Tuple[str, str, object]]) -> str:
+    sections = []
+    for title, tag, payload in blocks:
+        body = _dump_yaml(payload).rstrip()
+        sections.append(f"{title}\n<{tag}>\n{body}\n<{tag}\>")
+    return "\n\n".join(sections)
 
 
 class InterpreterSessionStore:
@@ -103,30 +118,33 @@ class InterpreterSessionStore:
         self._ctx_public_counter: Dict[int, int] = {}
         self._lock = asyncio.Lock()
 
-    async def create_session(self, ctx: Context) -> Tuple[str, _SessionRecord]:
+    async def create_session(
+        self, ctx: Context, description: str | None = None
+    ) -> Tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
             session_id = uuid.uuid4().hex
             counter = self._ctx_public_counter.get(key, 0) + 1
             self._ctx_public_counter[key] = counter
             public_id = str(counter)
-            session_label = f"session-{public_id}"
+            session_name = f"session-{public_id}"
             loop = asyncio.get_running_loop()
-            runner = AsyncInterpreterRunner(name=session_label, loop=loop)
+            runner = AsyncInterpreterRunner(name=session_name, loop=loop)
             record = _SessionRecord(
                 runner=runner,
-                logger=get_session_logger(session_label),
+                logger=get_session_logger(session_name),
                 ctx_key=key,
                 public_id=public_id,
+                description=description,
             )
             self._sessions[session_id] = record
             self._ctx_index.setdefault(key, set()).add(session_id)
             self._ctx_public_map.setdefault(key, {})[public_id] = session_id
             logger.info(
-                "create_session session_id=%s session_label=%s ctx_key=%s",
+                "create_session session_id=%s ctx_key=%s description=%s",
                 session_id,
-                session_label,
                 key,
+                description,
             )
             return session_id, record
 
@@ -159,14 +177,15 @@ class InterpreterSessionStore:
     ) -> Tuple[str, _SessionRecord]:
         internal_id, record = await self.get_session(ctx, session_id)
         loop = asyncio.get_running_loop()
-        session_label = f"session-{record.public_id}"
-        new_runner = AsyncInterpreterRunner(name=session_label, loop=loop)
+        runner_label = f"session-{record.public_id}"
+        new_runner = AsyncInterpreterRunner(name=runner_label, loop=loop)
         await record.runner.aclose()
         new_record = _SessionRecord(
             runner=new_runner,
             logger=record.logger,
             ctx_key=record.ctx_key,
             public_id=record.public_id,
+            description=record.description,
         )
         async with self._lock:
             self._sessions[internal_id] = new_record
@@ -214,6 +233,18 @@ class InterpreterSessionStore:
             raise ValueError("指定的 session 不存在或已关闭")
         return internal_id
 
+    async def update_description(
+        self, ctx: Context, session_id: str, description: str | None
+    ) -> Tuple[str, _SessionRecord]:
+        internal_id, record = await self.get_session(ctx, session_id)
+        record.description = description
+        logger.info(
+            "update_session_description session_id=%s ctx_key=%s",
+            internal_id,
+            record.ctx_key,
+        )
+        return internal_id, record
+
 
 session_store = InterpreterSessionStore()
 
@@ -235,18 +266,53 @@ def main() -> None:
     name="create_python_session",
     description="创建一个新的 Python 子解释器 session，并返回 session_id。",
 )
-async def create_python_session(ctx: Context | None = None) -> str:
+async def create_python_session(
+    description: Annotated[
+        str | None, Field(description="可选的 session 描述信息，方便区分用途")
+    ] = None,
+    ctx: Context | None = None,
+) -> str:
     if ctx is None:
         raise ValueError("Context 注入失败")
 
-    internal_id, record = await session_store.create_session(ctx)
-    record.logger.info("create_python_session session_id=%s", internal_id)
+    internal_id, record = await session_store.create_session(
+        ctx, description=description
+    )
+    record.logger.info(
+        "create_python_session description=%s session_id=%s",
+        record.description,
+        internal_id,
+    )
     logger.info(
         "create_python_session client=%s session_id=%s", ctx.client_id, internal_id
     )
-    return _tool_response(
-        "create_python_session", session=_session_payload(record), stat="new"
+    return f"New python session created, ID:{record.public_id}"
+
+
+@server.tool(
+    name="update_python_session_description",
+    description="更新指定 session 的描述信息，方便区分不同会话。",
+)
+async def update_python_session_description(
+    session_id: Annotated[str, Field(description="需要更新的 session ID")],
+    description: Annotated[
+        str | None, Field(description="新的描述信息，传入 None 表示清除")
+    ] = None,
+    ctx: Context | None = None,
+) -> str:
+    if ctx is None:
+        raise ValueError("Context 注入失败")
+
+    internal_id, record = await session_store.update_description(
+        ctx, session_id, description
     )
+    record.logger.info("update_description description=%s", description)
+    logger.info(
+        "update_python_session_description client=%s session=%s",
+        ctx.client_id,
+        internal_id,
+    )
+    return f"Session ID:{record.public_id} description updated to:{description}"
 
 
 @server.tool(
@@ -260,8 +326,8 @@ async def list_python_sessions(ctx: Context | None = None) -> str:
     sessions = await session_store.list_sessions(ctx)
     logger.info("list_python_sessions client=%s count=%d", ctx.client_id, len(sessions))
     session_entries = [_session_payload(record) for _, record in sessions]
-    return _tool_response(
-        "list_python_sessions", count=len(session_entries), session=session_entries
+    return _format_blocks(
+        [("Current active python sessions:", "sessions", session_entries)]
     )
 
 
@@ -278,7 +344,7 @@ async def close_python_session(
 
     internal_id, public_id = await session_store.close_session(ctx, session_id)
     logger.info("close_python_session client=%s session=%s", ctx.client_id, internal_id)
-    return _tool_response("close_python_session", sid=public_id, stat="closed")
+    return f"Session ID:{public_id} closed"
 
 
 @server.tool(
@@ -288,6 +354,10 @@ async def close_python_session(
 async def start_python_cell(
     session_id: Annotated[str, Field(description="要运行的 session ID")],
     code: Annotated[str, Field(description="要执行的 Python 代码")],
+    timeout: Annotated[
+        float | None,
+        Field(description="阻塞等待的秒数，<=0 或 None 表示立即返回并在后台继续运行"),
+    ] = 0.0,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
@@ -319,18 +389,72 @@ async def start_python_cell(
         )
         slog.exception("start_python_cell 异常")
         raise
-    logger.info(
-        "start_python_cell done client=%s session=%s cid=%s",
-        ctx.client_id,
-        internal_id,
-        cid,
-    )
-    slog.info("start_python_cell 已启动 cid=%s", cid)
-    return _tool_response(
-        "start_python_cell",
-        session=_session_payload(record),
-        cell={"cid": cid, "stat": "start"},
-    )
+    wait_timeout = None
+    if timeout is not None and timeout > 0:
+        wait_timeout = timeout
+    cell_info: Dict[str, Any]
+    if wait_timeout:
+        try:
+            result = await runner.wait_cell(cid, timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            logger.info(
+                "start_python_cell wait timeout client=%s session=%s cid=%s timeout=%s",
+                ctx.client_id,
+                internal_id,
+                cid,
+                wait_timeout,
+            )
+            slog.info(
+                "start_python_cell 超时，cid=%s timeout=%s，后台继续运行",
+                cid,
+                wait_timeout,
+            )
+            cell_info = {
+                "cell_id": cid,
+                "status": "running",
+                "timed_out": True,
+            }
+            return f"Code in Session ID:{record.public_id} Cell ID:{cid} timeout,but still running in background"
+        else:
+            stdout_text = result.get("stdout") or ""
+            stderr_text = result.get("stderr") or ""
+            result_text = result.get("result") or ""
+            exception_text = result.get("exception")
+            logger.info(
+                "start_python_cell completed client=%s session=%s cid=%s",
+                ctx.client_id,
+                internal_id,
+                cid,
+            )
+            slog.info("start_python_cell 在超时内完成 cid=%s", cid)
+            cell_info = {
+                "cell_id": cid,
+                "status": "completed",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "result": result_text,
+                "exception": exception_text,
+            }
+
+            return (
+                f"Code in Session ID:{record.public_id}Cell ID:{cid} complete:\n"
+                + _format_blocks(
+                    [
+                        ("Cell Result", "result", cell_info),
+                    ]
+                )
+            )
+
+    else:
+        logger.info(
+            "start_python_cell started client=%s session=%s cid=%s",
+            ctx.client_id,
+            internal_id,
+            cid,
+        )
+        slog.info("start_python_cell 已启动 cid=%s", cid)
+        cell_info = {"cell_id": cid, "status": "running"}
+        return f"Code in Session ID:{record.public_id}Cell ID:{cid} started"
 
 
 @server.tool(
@@ -370,19 +494,20 @@ async def get_python_cell_snapshot(
     stdout_text = snap.get("stdout") or ""
     stderr_text = snap.get("stderr") or ""
     result_text = snap.get("result") or ""
-    exception_text = snap.get("exception") or ""
+    exception_text = snap.get("exception") or None
     cell_info = {
-        "cid": snap["cell_id"],
-        "run": bool(snap["running"]),
-        "dn": bool(snap["done"]),
-        "out": stdout_text,
-        "err": stderr_text,
-        "val": result_text,
+        "cell_id": snap["cell_id"],
+        "running": bool(snap["running"]),
+        "done": bool(snap["done"]),
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "result": result_text,
+        "exception": exception_text,
     }
-    if exception_text:
-        cell_info["exc"] = exception_text
-    return _tool_response(
-        "get_python_cell_snapshot", session=_session_payload(record), cell=cell_info
+    return f"Session ID:{record.public_id}Cell ID:{snap["cell_id"]}\n" + _format_blocks(
+        [
+            ("result snapshot", "result", cell_info),
+        ]
     )
 
 
@@ -400,9 +525,7 @@ async def reset_python_session(
     internal_id, record = await session_store.reset_session(ctx, session_id)
     record.logger.info("reset_python_session 重置 session=%s", internal_id)
     logger.info("reset_python_session client=%s session=%s", ctx.client_id, internal_id)
-    return _tool_response(
-        "reset_python_session", session=_session_payload(record), stat="reset"
-    )
+    return "Session ID:{record.public_id} has been reset"
 
 
 @server.tool(
@@ -448,15 +571,17 @@ async def send_python_stdin(
         send_eof,
         chunk or "",
     )
-    return _tool_response(
-        "send_python_stdin",
-        session=_session_payload(record),
-        inp={
-            "len": len(chunk or ""),
-            "txt": chunk or "",
-            "nl": append_newline,
-            "eof": send_eof,
-        },
+    stdin_info = {
+        "length": len(chunk or ""),
+        "content": chunk or "",
+        "append_newline": append_newline,
+        "eof_sent": send_eof,
+    }
+
+    return f"Send stdin to Session ID:{record.public_id}\n" + _format_blocks(
+        [
+            ("stdin payload:", "stdin", stdin_info),
+        ]
     )
 
 
@@ -481,7 +606,7 @@ async def cancel_python_cell(
             internal_id,
         )
         slog.info("cancel_python_cell 当前无运行任务")
-        return _dump_yaml("当前无运行任务")
+        return f"No cells running in Session ID:{record.public_id}"
 
     success = runner.cancel_current_cell()
     logger.info(
@@ -491,10 +616,14 @@ async def cancel_python_cell(
         success,
     )
     slog.info("cancel_python_cell 已发送中断信号, 成功=%s", success)
-    return _tool_response(
-        "cancel_python_cell",
-        session=_session_payload(record),
-        success=success,
+    return f"Try to cancel Session ID:{record.public_id}\n" + _format_blocks(
+        [
+            (
+                "Cancel result:",
+                "state",
+                {"state": "running", "interrupt_acknowledged": success},
+            ),
+        ]
     )
 
 
@@ -521,20 +650,18 @@ async def list_python_cells(
     )
     slog.info("调用 list_python_cells, 总数=%d", len(cells))
 
-    status_map = {"running": "run", "completed": "done"}
     cells_data = [
         {
-            "cid": cell["cell_id"],
-            "stat": status_map.get(cell["status"], cell["status"]),
-            "exc": bool(cell["has_exception"]),
+            "cell_id": cell["cell_id"],
+            "status": cell["status"],
+            "has_exception": bool(cell["has_exception"]),
         }
         for cell in cells
     ]
-    return _tool_response(
-        "list_python_cells",
-        session=_session_payload(record),
-        tot=len(cells_data),
-        cell=cells_data,
+    return f"List cells in Session ID:{record.public_id}\n" + _format_blocks(
+        [
+            ("Cell listing:", "cells", {"total": len(cells_data), "items": cells_data}),
+        ]
     )
 
 

@@ -389,6 +389,9 @@ class AsyncInterpreterRunner:
         if cid in self._results:
             return self._results[cid]
         if cid != self._active_cid:
+            await asyncio.wait_for(self._cell_done.wait(), timeout=timeout)
+            if cid in self._results:
+                return self._results[cid]
             raise ValueError("指定的 cell_id 不存在或不是当前活动 cell")
         await asyncio.wait_for(self._cell_done.wait(), timeout=timeout)
         return self._results.get(cid, {
