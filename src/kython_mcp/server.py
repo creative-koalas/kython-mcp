@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Dict, List, Set, Tuple
 
 import yaml
@@ -88,6 +89,7 @@ class _SessionRecord:
     ctx_key: int
     public_id: str
     description: str | None = None
+    created_at: float = field(default_factory=time.time)
 
 
 def _session_payload(record: _SessionRecord) -> Dict[str, Any]:
@@ -136,6 +138,7 @@ class InterpreterSessionStore:
                 ctx_key=key,
                 public_id=public_id,
                 description=description,
+                created_at=time.time(),
             )
             self._sessions[session_id] = record
             self._ctx_index.setdefault(key, set()).add(session_id)
@@ -157,7 +160,7 @@ class InterpreterSessionStore:
                 for sid in session_ids
                 if sid in self._sessions
             ]
-        return records
+        return sorted(records, key=lambda item: item[1].created_at)
 
     async def get_session(
         self, ctx: Context, session_id: str
@@ -186,6 +189,7 @@ class InterpreterSessionStore:
             ctx_key=record.ctx_key,
             public_id=record.public_id,
             description=record.description,
+            created_at=record.created_at,
         )
         async with self._lock:
             self._sessions[internal_id] = new_record
@@ -349,7 +353,7 @@ async def close_python_session(
 
 @server.tool(
     name="start_python_cell",
-    description="非阻塞启动执行 Python 代码，立即返回 cell_id。",
+    description="""在指定 session 中启动执行 Python 代码.配置timeout<=0的时候,程序将在后台执行并立即返回ID.配置timeout>=0的时候,程序运行完毕后会直接返回结果;如果超时,程序不会立即停止,而是在后台继续执行.""",
 )
 async def start_python_cell(
     session_id: Annotated[str, Field(description="要运行的 session ID")],
@@ -432,7 +436,7 @@ async def start_python_cell(
                 "status": "completed",
                 "stdout": stdout_text,
                 "stderr": stderr_text,
-                "result": result_text,
+                # "result": result_text,
                 "exception": exception_text,
             }
 
@@ -469,45 +473,64 @@ async def get_python_cell_snapshot(
             description="可选指定 cell_id；为空则优先返回当前活动 cell，否则返回最近完成者"
         ),
     ] = None,
+    n_cells: Annotated[
+        int | None,
+        Field(description="查询最近的 n 个 cell 快照，仅在未指定 cell_id 时生效"),
+    ] = 1,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
         raise ValueError("Context 注入失败")
+    if n_cells is not None and n_cells <= 0:
+        raise ValueError("n_cells 需要为正整数")
     internal_id, record = await session_store.get_session(ctx, session_id)
     runner = record.runner
     slog = record.logger
-    snap = runner.get_cell_snapshot(cell_id)
+    snapshots: List[Dict[str, Any]] = []
+    if cell_id is not None:
+        snapshots = [runner.get_cell_snapshot(cell_id)]
+    else:
+        limit = n_cells or 1
+        cells = runner.list_cells()
+        if not cells:
+            raise ValueError("没有可用的 cell")
+        sorted_ids = sorted({cell["cell_id"] for cell in cells}, reverse=True)
+        target_ids = sorted_ids[:limit]
+        snapshots = [runner.get_cell_snapshot(cid) for cid in target_ids]
+    cell_infos = []
+    for snap in snapshots:
+        stdout_text = snap.get("stdout") or ""
+        stderr_text = snap.get("stderr") or ""
+        result_text = snap.get("result") or ""
+        exception_text = snap.get("exception") or None
+        cell_infos.append(
+            {
+                "cell_id": snap["cell_id"],
+                "running": bool(snap["running"]),
+                "done": bool(snap["done"]),
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                # "result": result_text,
+                "exception": exception_text,
+            }
+        )
     logger.info(
-        "get_python_cell_snapshot client=%s session=%s cid=%s running=%s done=%s",
+        "get_python_cell_snapshot client=%s session=%s cells=%s",
         ctx.client_id,
         internal_id,
-        snap["cell_id"],
-        snap["running"],
-        snap["done"],
+        [info["cell_id"] for info in cell_infos],
     )
     slog.info(
-        "调用 get_python_cell_snapshot cid=%s, running=%s, done=%s",
-        snap["cell_id"],
-        snap["running"],
-        snap["done"],
+        "调用 get_python_cell_snapshot 汇总 %s 个 cell: %s",
+        len(cell_infos),
+        [info["cell_id"] for info in cell_infos],
     )
-    stdout_text = snap.get("stdout") or ""
-    stderr_text = snap.get("stderr") or ""
-    result_text = snap.get("result") or ""
-    exception_text = snap.get("exception") or None
-    cell_info = {
-        "cell_id": snap["cell_id"],
-        "running": bool(snap["running"]),
-        "done": bool(snap["done"]),
-        "stdout": stdout_text,
-        "stderr": stderr_text,
-        "result": result_text,
-        "exception": exception_text,
-    }
-    return f"Session ID:{record.public_id}Cell ID:{snap["cell_id"]}\n" + _format_blocks(
-        [
-            ("result snapshot", "result", cell_info),
-        ]
+    blocks = [
+        (f"Cell {info['cell_id']} snapshot", "result", info) for info in cell_infos
+    ]
+    return (
+        f"Session ID:{record.public_id} 最新 {len(cell_infos)} 个 cell 快照\n"
+        + _format_blocks(blocks)
     )
 
 
@@ -623,44 +646,6 @@ async def cancel_python_cell(
                 "state",
                 {"state": "running", "interrupt_acknowledged": success},
             ),
-        ]
-    )
-
-
-@server.tool(
-    name="list_python_cells",
-    description="列出当前会话中所有可用的 Python cell，包括已完成和正在运行的。",
-)
-async def list_python_cells(
-    session_id: Annotated[str, Field(description="要查询的 session ID")],
-    ctx: Context | None = None,
-) -> str:
-    if ctx is None:
-        raise ValueError("Context 注入失败")
-
-    internal_id, record = await session_store.get_session(ctx, session_id)
-    runner = record.runner
-    slog = record.logger
-    cells = runner.list_cells()
-    logger.info(
-        "list_python_cells client=%s session=%s count=%d",
-        ctx.client_id,
-        internal_id,
-        len(cells),
-    )
-    slog.info("调用 list_python_cells, 总数=%d", len(cells))
-
-    cells_data = [
-        {
-            "cell_id": cell["cell_id"],
-            "status": cell["status"],
-            "has_exception": bool(cell["has_exception"]),
-        }
-        for cell in cells
-    ]
-    return f"List cells in Session ID:{record.public_id}\n" + _format_blocks(
-        [
-            ("Cell listing:", "cells", {"total": len(cells_data), "items": cells_data}),
         ]
     )
 
