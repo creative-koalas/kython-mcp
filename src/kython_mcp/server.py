@@ -16,6 +16,15 @@ from .local_log import get_logger, get_session_logger
 logger = get_logger("kython_mcp.server")
 
 
+def str_presenter(dumper, data):
+    """强制多行字符串使用 YAML 的 | 样式，更易读"""
+    if '\n' in data:
+        # style='|' 保留换行，style='>' 折叠换行
+        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+
+yaml.add_representer(str, str_presenter)
+
 def _precheck_syntax(code: str) -> None:
     """在主进程侧进行语法预检，确保尽早失败。
 
@@ -46,7 +55,8 @@ def _dump_yaml(data: object) -> str:
         sort_keys=False,
         indent=2,
     )
-    return dumped.replace("\n\n", "\n")
+    return dumped
+    # return dumped.replace("\n\n", "\n")
 
 
 class StartCellResult(BaseModel):
@@ -463,7 +473,7 @@ async def start_python_cell(
 
 @server.tool(
     name="get_python_cell_snapshot",
-    description="获取指定或当前活动 cell 的输出快照（运行中或已完成）。",
+    description="获取指定 cell 或最近/全部已执行 cell 的输出快照（运行中或已完成）。",
 )
 async def get_python_cell_snapshot(
     session_id: Annotated[str, Field(description="要查询的 session ID")],
@@ -475,7 +485,12 @@ async def get_python_cell_snapshot(
     ] = None,
     n_cells: Annotated[
         int | None,
-        Field(description="查询最近的 n 个 cell 快照，仅在未指定 cell_id 时生效"),
+        Field(
+            description=(
+                "查询最近的 n 个 cell 快照，仅在未指定 cell_id 时生效；"
+                "为空则返回全部 cell"
+            )
+        ),
     ] = 1,
     ctx: Context | None = None,
 ) -> str:
@@ -490,15 +505,17 @@ async def get_python_cell_snapshot(
     if cell_id is not None:
         snapshots = [runner.get_cell_snapshot(cell_id)]
     else:
-        limit = n_cells or 1
         cells = runner.list_cells()
         if not cells:
             raise ValueError("没有可用的 cell")
         sorted_ids = sorted({cell["cell_id"] for cell in cells}, reverse=True)
-        target_ids = sorted_ids[:limit]
+        if n_cells is None:
+            target_ids = sorted_ids
+        else:
+            target_ids = sorted_ids[:n_cells]
         snapshots = [runner.get_cell_snapshot(cid) for cid in target_ids]
     cell_infos = []
-    for snap in snapshots:
+    for snap in reversed(snapshots):
         stdout_text = snap.get("stdout") or ""
         stderr_text = snap.get("stderr") or ""
         result_text = snap.get("result") or ""
