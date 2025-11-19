@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Dict, List, Set, Tuple
+from typing import Annotated, Any
 
 import yaml
 from mcp.server.fastmcp import Context, FastMCP
@@ -102,7 +102,7 @@ class _SessionRecord:
     created_at: float = field(default_factory=time.time)
 
 
-def _session_payload(record: _SessionRecord) -> Dict[str, Any]:
+def _session_payload(record: _SessionRecord) -> dict[str, Any]:
     return {
         "id": record.public_id,
         "metadata": {
@@ -112,7 +112,7 @@ def _session_payload(record: _SessionRecord) -> Dict[str, Any]:
     }
 
 
-def _format_blocks(blocks: List[Tuple[str, str, object]]) -> str:
+def _format_blocks(blocks: list[tuple[str, str, object]]) -> str:
     sections = []
     for title, tag, payload in blocks:
         body = _dump_yaml(payload).rstrip()
@@ -124,15 +124,15 @@ class InterpreterSessionStore:
     """管理单个 MCP 会话下的多个 Python session。"""
 
     def __init__(self):
-        self._sessions: Dict[str, _SessionRecord] = {}
-        self._ctx_index: Dict[int, Set[str]] = {}
-        self._ctx_public_map: Dict[int, Dict[str, str]] = {}
-        self._ctx_public_counter: Dict[int, int] = {}
+        self._sessions: dict[str, _SessionRecord] = {}
+        self._ctx_index: dict[int, set[str]] = {}
+        self._ctx_public_map: dict[int, dict[str, str]] = {}
+        self._ctx_public_counter: dict[int, int] = {}
         self._lock = asyncio.Lock()
 
     async def create_session(
         self, ctx: Context, description: str | None = None
-    ) -> Tuple[str, _SessionRecord]:
+    ) -> tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
             session_id = uuid.uuid4().hex
@@ -161,7 +161,7 @@ class InterpreterSessionStore:
             )
             return session_id, record
 
-    async def list_sessions(self, ctx: Context) -> List[Tuple[str, _SessionRecord]]:
+    async def list_sessions(self, ctx: Context) -> list[tuple[str, _SessionRecord]]:
         key = self._session_key(ctx)
         async with self._lock:
             session_ids = list(self._ctx_index.get(key, set()))
@@ -174,7 +174,7 @@ class InterpreterSessionStore:
 
     async def get_session(
         self, ctx: Context, session_id: str
-    ) -> Tuple[str, _SessionRecord]:
+    ) -> tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
             internal_id = self._resolve_internal_id_locked(key, session_id)
@@ -187,7 +187,7 @@ class InterpreterSessionStore:
 
     async def reset_session(
         self, ctx: Context, session_id: str
-    ) -> Tuple[str, _SessionRecord]:
+    ) -> tuple[str, _SessionRecord]:
         internal_id, record = await self.get_session(ctx, session_id)
         loop = asyncio.get_running_loop()
         runner_label = f"session-{record.public_id}"
@@ -208,7 +208,7 @@ class InterpreterSessionStore:
         )
         return internal_id, new_record
 
-    async def close_session(self, ctx: Context, session_id: str) -> Tuple[str, str]:
+    async def close_session(self, ctx: Context, session_id: str) -> tuple[str, str]:
         key = self._session_key(ctx)
         async with self._lock:
             internal_id = self._resolve_internal_id_locked(key, session_id)
@@ -249,7 +249,7 @@ class InterpreterSessionStore:
 
     async def update_description(
         self, ctx: Context, session_id: str, description: str | None
-    ) -> Tuple[str, _SessionRecord]:
+    ) -> tuple[str, _SessionRecord]:
         internal_id, record = await self.get_session(ctx, session_id)
         record.description = description
         logger.info(
@@ -406,7 +406,7 @@ async def start_python_cell(
     wait_timeout = None
     if timeout is not None and timeout > 0:
         wait_timeout = timeout
-    cell_info: Dict[str, Any]
+    cell_info: dict[str, Any]
     if wait_timeout:
         try:
             result = await runner.wait_cell(cid, timeout=wait_timeout)
@@ -491,7 +491,7 @@ async def get_python_cell_snapshot(
                 "为空则返回全部 cell"
             )
         ),
-    ] = 1,
+    ] = None,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
@@ -501,7 +501,7 @@ async def get_python_cell_snapshot(
     internal_id, record = await session_store.get_session(ctx, session_id)
     runner = record.runner
     slog = record.logger
-    snapshots: List[Dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
     if cell_id is not None:
         snapshots = [runner.get_cell_snapshot(cell_id)]
     else:
