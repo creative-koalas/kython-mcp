@@ -361,7 +361,7 @@ async def start_python_cell(
     timeout: Annotated[
         float | None,
         Field(description="阻塞等待的秒数，<=0 或 None 表示立即返回并在后台继续运行"),
-    ] = 0.0,
+    ] = None,
     ctx: Context | None = None,
 ) -> str:
     if ctx is None:
@@ -532,23 +532,6 @@ async def get_python_cell_snapshot(
         f"Session ID:{record.public_id} 最新 {len(cell_infos)} 个 cell 快照\n"
         + _format_blocks(blocks)
     )
-
-
-@server.tool(
-    name="reset_python_session",
-    description="为指定 session 重建子解释器，以获得全新的命名空间。",
-)
-async def reset_python_session(
-    session_id: Annotated[str, Field(description="要重置的 session ID")],
-    ctx: Context | None = None,
-) -> str:
-    if ctx is None:
-        raise ValueError("Context 注入失败")
-
-    internal_id, record = await session_store.reset_session(ctx, session_id)
-    record.logger.info("reset_python_session 重置 session=%s", internal_id)
-    logger.info("reset_python_session client=%s session=%s", ctx.client_id, internal_id)
-    return "Session ID:{record.public_id} has been reset"
 
 
 @server.tool(
