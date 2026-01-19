@@ -111,7 +111,7 @@ class _CancelFlag:
 
     def check(self) -> None:
         if self._event.is_set():
-            raise KeyboardInterrupt("执行已被取消")
+            raise KeyboardInterrupt("Execution cancelled")
 
 
 class _ExecutionState:

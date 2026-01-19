@@ -198,14 +198,34 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     cid,
                     wait_timeout,
                 )
+                current = runner.get_current_output()
+                output = "".join(
+                    [
+                        current.stdout or "",
+                        current.result or "",
+                        current.stderr or "",
+                    ]
+                )
                 return (
-                    f"Command in Session ID:{record.public_id} Cell ID:{cid} timeout, "
-                    "but still running in background"
+                    "Command is still running after "
+                    f"{wait_timeout:.2f} seconds;\n"
+                    "this could mean the command is doing blocking operations "
+                    "(e.g., disk reading, downloading)\n"
+                    "or is awaiting input (e.g., password, confirmation).\n\n"
+                    "Currently executing command buffer:\n"
+                    f"<command>\n{command}\n</command>\n\n"
+                    "Current command output:\n\n"
+                    f"<command-output>\n{output}\n</command-output>\n\n"
+                    "It is recommended to use `snapshot` on this session later to see command status,\n"
+                    "and use `send_keys` to interact with the session if necessary.\n"
+                    "You cannot execute another command on this session until the current command finishes or get terminated."
                 )
             else:
                 stdout_text = result.get("stdout") or ""
                 stderr_text = result.get("stderr") or ""
-                exception_text = result.get("exception")
+                exception_text = result.get("exception") or ""
+                result_text = result.get("result") or ""
+                duration_seconds = result.get("duration_seconds")
                 logger.info(
                     "submit_command completed client=%s session=%s cid=%s",
                     ctx.client_id,
@@ -213,17 +233,25 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     cid,
                 )
                 slog.info("submit_command completed cid=%s", cid)
-                cell_info = {
-                    "cell_id": cid,
-                    "status": "completed",
-                    "stdout": stdout_text,
-                    "stderr": stderr_text,
-                    "exception": exception_text,
-                }
-
+                output_parts = []
+                if stdout_text:
+                    output_parts.append(stdout_text)
+                if result_text:
+                    output_parts.append(result_text)
+                if stderr_text:
+                    output_parts.append(stderr_text)
+                if exception_text:
+                    output_parts.append(exception_text)
+                output = "".join(output_parts)
+                duration_display = "unknown"
+                if isinstance(duration_seconds, (float, int)):
+                    duration_display = f"{duration_seconds:.2f}"
                 return (
-                    f"Command in Session ID:{record.public_id} Cell ID:{cid} complete:\n"
-                    + format_blocks([("Cell Result", "result", cell_info)])
+                    f"Command finished in {duration_display} seconds.\n\n"
+                    "Executed command buffer:\n"
+                    f"<command>\n{command}\n</command>\n\n"
+                    "Command output:\n\n"
+                    f"<command-output>\n{output}\n</command-output>"
                 )
 
         logger.info(

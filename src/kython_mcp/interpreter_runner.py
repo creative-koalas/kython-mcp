@@ -150,12 +150,16 @@ class AsyncInterpreterRunner:
             self._last_exc = msg.get("exception")
             cid = msg.get("cell_id")
             out = self.get_current_output()
+            duration_seconds = None
+            if msg.get("timing_ms") is not None:
+                duration_seconds = float(msg.get("timing_ms")) / 1000.0
             self._results[cid] = {
                 "cell_id": cid,
                 "stdout": out.stdout,
                 "stderr": out.stderr,
                 "result": out.result,
                 "exception": self._last_exc,
+                "duration_seconds": duration_seconds,
             }
             self._cell_done.set()
             self._running = False
@@ -185,7 +189,7 @@ class AsyncInterpreterRunner:
 
     def start_cell(self, source: str) -> int:
         if self._running:
-            raise BusyError(f"会话 {self.name} 正在执行 cell {self._cell_id}")
+            raise BusyError(f"Session {self.name} is already running cell {self._cell_id}")
 
         self._running = True
         self._cell_done = asyncio.Event()
@@ -202,7 +206,7 @@ class AsyncInterpreterRunner:
             await asyncio.wait_for(self._cell_done.wait(), timeout=timeout)
             if cid in self._results:
                 return self._results[cid]
-            raise ValueError("指定的 cell_id 不存在或不是当前活动 cell")
+            raise ValueError("Cell ID not found or not the active cell")
         await asyncio.wait_for(self._cell_done.wait(), timeout=timeout)
         return self._results.get(
             cid,
@@ -211,7 +215,7 @@ class AsyncInterpreterRunner:
                 "stdout": "",
                 "stderr": "",
                 "result": "",
-                "exception": "执行结果不可用",
+                "exception": "Result unavailable",
             },
         )
 
@@ -235,7 +239,7 @@ class AsyncInterpreterRunner:
             elif self._results:
                 target_cid = max(self._results)
             else:
-                raise ValueError("没有可用的 cell")
+                raise ValueError("No cells available")
 
         if target_cid == self._active_cid:
             out = self.get_current_output()
@@ -261,7 +265,7 @@ class AsyncInterpreterRunner:
                 "done": True,
             }
 
-        raise ValueError("指定的 cell_id 不存在")
+        raise ValueError("Cell ID not found")
 
     def list_cells(self) -> List[Dict[str, object]]:
         cells = []
@@ -288,7 +292,7 @@ class AsyncInterpreterRunner:
 
     async def run_cell(self, source: str, timeout: Optional[float] = None) -> Dict[str, object]:
         if self._running:
-            raise BusyError(f"会话 {self.name} 正在执行 cell {self._cell_id}")
+            raise BusyError(f"Session {self.name} is already running cell {self._cell_id}")
 
         self._running = True
         self._cell_done = asyncio.Event()
@@ -313,7 +317,7 @@ class AsyncInterpreterRunner:
 
     def send_stdin(self, chunk: str):
         if not isinstance(chunk, str):
-            raise TypeError("stdin 数据必须为字符串")
+            raise TypeError("stdin payload must be a string")
         self._send_control({"type": "stdin", "chunk": chunk})
 
     def send_stdin_eof(self):

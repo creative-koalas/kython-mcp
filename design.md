@@ -55,8 +55,8 @@ The API mirrors kmux semantics so agents can reuse the same mental model.
     - `timeout_seconds > 0`: wait for completion, return result; if timeout, continues in background
   - **Output**:
     - Started: `"Command in Session ID:{id} Cell ID:{cid} started"`
-    - Completed: YAML block with stdout/stderr/exception
-    - Timeout: `"... timeout, but still running in background"`
+    - Completed: `"Command finished in {seconds} seconds"` + command buffer + output block
+    - Timeout: running status + command buffer + partial output
 
 - **snapshot**
   - **Purpose**: Get cell output snapshot (like kmux snapshot)
