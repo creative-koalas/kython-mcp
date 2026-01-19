@@ -138,7 +138,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     "Seconds to wait. <=0 or null returns immediately while the cell keeps running."
                 )
             ),
-        ] = None,
+        ] = 5.0,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
@@ -177,6 +177,9 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             )
             slog.exception("submit_command exception")
             raise
+
+        if timeout_seconds is None:
+            timeout_seconds = 5.0
 
         wait_timeout = None
         if timeout_seconds is not None and timeout_seconds > 0:
