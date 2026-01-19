@@ -46,6 +46,8 @@ class AsyncInterpreterRunner:
         }
         self._results: Dict[int, Dict[str, object]] = {}
         self._active_cid: Optional[int] = None
+        self._cell_sources: Dict[int, str] = {}
+        self._active_source: Optional[str] = None
 
         # 事件流 (支持多订阅者的广播)
         self.events: asyncio.Queue = asyncio.Queue()
@@ -133,6 +135,13 @@ class AsyncInterpreterRunner:
         except Exception:
             pass
 
+    def get_active_source(self) -> Optional[str]:
+        return self._active_source
+
+    def get_cell_source(self, cid: int) -> Optional[str]:
+        return self._cell_sources.get(cid)
+
+
     async def _handle_msg(self, msg: dict):
         msg_type = msg.get("type")
 
@@ -165,6 +174,7 @@ class AsyncInterpreterRunner:
             self._running = False
             self._worker_thread = None
             self._active_cid = None
+            self._active_source = None
         elif msg_type == "cell_rejected":
             pass
 
@@ -195,6 +205,9 @@ class AsyncInterpreterRunner:
         self._cell_done = asyncio.Event()
         self._cell_id += 1
         cid = self._cell_id
+
+        self._cell_sources[cid] = source
+        self._active_source = source
 
         self._send_control({"type": "run_cell", "cell_id": cid, "source": source})
         return cid
@@ -230,6 +243,7 @@ class AsyncInterpreterRunner:
                 "exception": r.get("exception"),
                 "running": False,
                 "done": True,
+                "source": self._cell_sources.get(cid),
             }
 
         target_cid = cid
@@ -251,6 +265,7 @@ class AsyncInterpreterRunner:
                 "exception": None,
                 "running": True,
                 "done": False,
+                "source": self._active_source,
             }
 
         if target_cid in self._results:
@@ -263,6 +278,7 @@ class AsyncInterpreterRunner:
                 "exception": r.get("exception"),
                 "running": False,
                 "done": True,
+                "source": self._cell_sources.get(target_cid),
             }
 
         raise ValueError("Cell ID not found")
@@ -298,6 +314,9 @@ class AsyncInterpreterRunner:
         self._cell_done = asyncio.Event()
         self._cell_id += 1
         cid = self._cell_id
+
+        self._cell_sources[cid] = source
+        self._active_source = source
 
         self._send_control({"type": "run_cell", "cell_id": cid, "source": source})
 

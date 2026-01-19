@@ -301,11 +301,13 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             stderr_text = snap.get("stderr") or ""
             result_text = snap.get("result") or ""
             exception_text = snap.get("exception") or None
+            source_text = snap.get("source") or ""
             cell_infos.append(
                 {
                     "cell_id": snap["cell_id"],
                     "running": bool(snap["running"]),
                     "done": bool(snap["done"]),
+                    "source": source_text,
                     "stdout": stdout_text,
                     "stderr": stderr_text,
                     "result": result_text,

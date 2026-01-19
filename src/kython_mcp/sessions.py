@@ -195,13 +195,31 @@ class InterpreterSessionStore:
         return internal_id
 
 
+def _running_cell_snippet(source: str | None, max_len: int = 80) -> str | None:
+    if not source:
+        return None
+    lines = source.splitlines()
+    first = lines[0] if lines else ""
+    truncated = first
+    if len(first) > max_len:
+        truncated = first[:max_len] + "..."
+    elif len(lines) > 1:
+        truncated = first + "..."
+    return truncated
+    
+
 def session_payload(record: SessionRecord) -> dict[str, Any]:
+    running_snippet = None
+    if record.runner.is_running:
+        running_snippet = _running_cell_snippet(record.runner.get_active_source())
+
     return {
         "id": record.public_id,
         "metadata": {
             "label": record.label,
             "description": record.description,
             "running": record.runner.is_running,
+            "running_cell": running_snippet,
             "python_executable": record.python_executable,
         },
     }
