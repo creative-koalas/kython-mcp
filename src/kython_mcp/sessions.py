@@ -16,6 +16,8 @@ logger = get_logger("kython_mcp.sessions")
 
 @dataclass
 class SessionRecord:
+    """Snapshot of a Python session."""
+
     runner: AsyncInterpreterRunner
     logger: object
     ctx_key: int
@@ -27,7 +29,7 @@ class SessionRecord:
 
 
 class InterpreterSessionStore:
-    """管理单个 MCP 会话下的多个 Python session。"""
+    """Manage Python sessions under a single MCP client context."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, SessionRecord] = {}
@@ -97,9 +99,9 @@ class InterpreterSessionStore:
             internal_id = self._resolve_internal_id_locked(key, session_id)
             record = self._sessions.get(internal_id)
         if record is None:
-            raise ValueError("指定的 session 不存在或已关闭")
+            raise ValueError("Session not found or already closed")
         if record.ctx_key != key:
-            raise ValueError("session 不属于当前 MCP 会话")
+            raise ValueError("Session does not belong to current MCP context")
         return internal_id, record
 
     async def reset_session(
@@ -135,9 +137,9 @@ class InterpreterSessionStore:
             internal_id = self._resolve_internal_id_locked(key, session_id)
             record = self._sessions.pop(internal_id, None)
             if record is None:
-                raise ValueError("指定的 session 不存在或已关闭")
+                raise ValueError("Session not found or already closed")
             if record.ctx_key != key:
-                raise ValueError("session 不属于当前 MCP 会话")
+                raise ValueError("Session does not belong to current MCP context")
             if key in self._ctx_index:
                 self._ctx_index[key].discard(internal_id)
             if key in self._ctx_public_map:
@@ -189,7 +191,7 @@ class InterpreterSessionStore:
         public_map = self._ctx_public_map.get(key, {})
         internal_id = public_map.get(public_id)
         if internal_id is None:
-            raise ValueError("指定的 session 不存在或已关闭")
+            raise ValueError("Session not found or already closed")
         return internal_id
 
 

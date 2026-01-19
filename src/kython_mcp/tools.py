@@ -7,7 +7,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .interpreter_runner import BusyError
-from .sessions import InterpreterSessionStore, SessionRecord, session_payload
+from .sessions import InterpreterSessionStore, session_payload
 from .utils import format_blocks, precheck_syntax
 from .local_log import get_logger
 
@@ -15,25 +15,27 @@ logger = get_logger("kython_mcp.tools")
 
 
 def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> None:
+    """Register all MCP tools on the server."""
+
     @server.tool(
         name="create_session",
-        description="创建一个新的 Python 会话（对齐 kmux create_session）。",
+        description="Create a new Python session (kmux-style).",
     )
     async def create_session(
         label: Annotated[
-            str | None, Field(description="可选会话名称，类似 kmux 的 label")
+            str | None, Field(description="Optional session label (kmux style).")
         ] = None,
         description: Annotated[
-            str | None, Field(description="可选会话描述")
+            str | None, Field(description="Optional session description.")
         ] = None,
         python_executable: Annotated[
             str | None,
-            Field(description="可选 Python 可执行路径，用于指定不同环境"),
+            Field(description="Optional Python executable path for custom envs."),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, record = await session_store.create_session(
             ctx, label=label, description=description, python_executable=python_executable
@@ -49,11 +51,11 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="list_sessions",
-        description="列出当前 MCP 会话下已创建的所有 session（对齐 kmux list_sessions）。",
+        description="List active sessions for current MCP connection.",
     )
     async def list_sessions(ctx: Context | None = None) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         sessions = await session_store.list_sessions(ctx)
         logger.info("list_sessions client=%s count=%d", ctx.client_id, len(sessions))
@@ -62,17 +64,17 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="update_session_label",
-        description="更新指定 session 的 label（对齐 kmux update_session_label）。",
+        description="Update session label (kmux-style).",
     )
     async def update_session_label(
-        session_id: Annotated[str, Field(description="需要更新的 session ID")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
         label: Annotated[
-            str | None, Field(description="新的 label，传入 None 表示清除")
+            str | None, Field(description="New label. Use null to clear.")
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, record = await session_store.update_label(ctx, session_id, label)
         record.logger.info("update_label label=%s", label)
@@ -81,17 +83,17 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="update_session_description",
-        description="更新指定 session 的描述信息（对齐 kmux update_session_description）。",
+        description="Update session description (kmux-style).",
     )
     async def update_session_description(
-        session_id: Annotated[str, Field(description="需要更新的 session ID")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
         description: Annotated[
-            str | None, Field(description="新的描述信息，传入 None 表示清除")
+            str | None, Field(description="New description. Use null to clear.")
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, record = await session_store.update_description(
             ctx, session_id, description
@@ -106,14 +108,14 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="delete_session",
-        description="关闭并移除指定 session（对齐 kmux delete_session）。",
+        description="Close and remove a session (kmux-style).",
     )
     async def delete_session(
-        session_id: Annotated[str, Field(description="要关闭的 session ID")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, public_id = await session_store.close_session(ctx, session_id)
         logger.info("delete_session client=%s session=%s", ctx.client_id, internal_id)
@@ -121,21 +123,26 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="submit_command",
-        description="""在指定 session 中执行 Python 代码（对齐 kmux submit_command）。
-        timeout_seconds <=0 或 None：立即返回 cell_id 并在后台执行。
-        timeout_seconds >0：等待完成并返回结果；超时则后台继续运行。""",
+        description=(
+            "Execute Python code in a session (kmux-style). "
+            "timeout_seconds<=0 returns immediately; >0 waits until completion."
+        ),
     )
     async def submit_command(
-        session_id: Annotated[str, Field(description="要运行的 session ID")],
-        command: Annotated[str, Field(description="要执行的 Python 代码")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
+        command: Annotated[str, Field(description="Python code to execute.")],
         timeout_seconds: Annotated[
             float | None,
-            Field(description="阻塞等待的秒数，<=0 或 None 表示立即返回并在后台继续运行"),
+            Field(
+                description=(
+                    "Seconds to wait. <=0 or null returns immediately while the cell keeps running."
+                )
+            ),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         precheck_syntax(command)
 
@@ -149,7 +156,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 internal_id,
             )
             slog.info(
-                "调用 submit_command, 代码长度=%d\n代码:\n%s",
+                "submit_command code_len=%d\ncode:\n%s",
                 len(command or ""),
                 command,
             )
@@ -160,15 +167,15 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 ctx.client_id,
                 internal_id,
             )
-            slog.warning("submit_command 忙，拒绝执行")
-            raise RuntimeError(f"当前会话正在执行其他代码: {exc}") from exc
+            slog.warning("submit_command busy, rejected")
+            raise RuntimeError(f"Session is busy: {exc}") from exc
         except Exception:
             logger.exception(
                 "submit_command error client=%s session=%s",
                 ctx.client_id,
                 internal_id,
             )
-            slog.exception("submit_command 异常")
+            slog.exception("submit_command exception")
             raise
 
         wait_timeout = None
@@ -187,7 +194,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     wait_timeout,
                 )
                 slog.info(
-                    "submit_command 超时，cid=%s timeout=%s，后台继续运行",
+                    "submit_command timeout cid=%s timeout=%s, continue in background",
                     cid,
                     wait_timeout,
                 )
@@ -205,7 +212,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     internal_id,
                     cid,
                 )
-                slog.info("submit_command 在超时内完成 cid=%s", cid)
+                slog.info("submit_command completed cid=%s", cid)
                 cell_info = {
                     "cell_id": cid,
                     "status": "completed",
@@ -225,22 +232,22 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             internal_id,
             cid,
         )
-        slog.info("submit_command 已启动 cid=%s", cid)
+        slog.info("submit_command started cid=%s", cid)
         return f"Command in Session ID:{record.public_id} Cell ID:{cid} started"
 
     @server.tool(
         name="snapshot",
-        description="获取指定 session 的输出快照（对齐 kmux snapshot）。",
+        description="Fetch output snapshots for a session (kmux-style).",
     )
     async def snapshot(
-        session_id: Annotated[str, Field(description="要查询的 session ID")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
         include_all: Annotated[
-            bool, Field(description="是否返回所有 cell；false 则返回最新一个")
+            bool, Field(description="Return all cells instead of latest.")
         ] = False,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, record = await session_store.get_session(ctx, session_id)
         runner = record.runner
@@ -248,7 +255,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
         cells = runner.list_cells()
         if not cells:
-            raise ValueError("没有可用的 cell")
+            raise ValueError("No cells available")
 
         sorted_ids = sorted({cell["cell_id"] for cell in cells})
         if include_all:
@@ -281,7 +288,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             internal_id,
             [info["cell_id"] for info in cell_infos],
         )
-        slog.info("调用 snapshot 汇总 %s 个 cell", len(cell_infos))
+        slog.info("snapshot collected %s cells", len(cell_infos))
         blocks = [
             (f"Cell {info['cell_id']} snapshot", "result", info) for info in cell_infos
         ]
@@ -289,19 +296,19 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="send_keys",
-        description="向 Python stdin 写入内容（对齐 kmux send_keys）。",
+        description="Send data to Python stdin (kmux-style).",
     )
     async def send_keys(
-        session_id: Annotated[str, Field(description="目标 session ID")],
-        keys: Annotated[str, Field(description="要写入的内容，支持转义字符")],
+        session_id: Annotated[str, Field(description="Target session ID.")],
+        keys: Annotated[str, Field(description="Payload to send (supports escapes).")],
         append_newline: Annotated[
-            bool, Field(description="写入后自动追加换行符")
+            bool, Field(description="Append newline after payload.")
         ] = False,
-        send_eof: Annotated[bool, Field(description="是否在写入后发送 EOF")] = False,
+        send_eof: Annotated[bool, Field(description="Send EOF after payload.")] = False,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
-            raise ValueError("Context 注入失败")
+            raise ValueError("Context injection failed")
 
         internal_id, record = await session_store.get_session(ctx, session_id)
         runner = record.runner
@@ -322,7 +329,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             send_eof,
         )
         slog.info(
-            "调用 send_keys, 数据长度=%d, 追加换行=%s, EOF=%s\n数据:\n%s",
+            "send_keys len=%d newline=%s eof=%s\npayload:\n%s",
             len(keys or ""),
             append_newline,
             send_eof,

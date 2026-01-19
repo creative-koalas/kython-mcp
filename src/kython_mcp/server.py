@@ -15,7 +15,10 @@ session_store = InterpreterSessionStore()
 
 server = FastMCP(
     name="Kython Process Interpreter",
-    instructions="使用 create_session 创建独立 Python session，submit_command 执行代码，snapshot 获取输出快照。",
+    instructions=(
+        "Use create_session to spawn a Python session, submit_command to execute code, "
+        "and snapshot to fetch cell outputs."
+    ),
     debug=bool_env("FASTMCP_DEBUG", "false"),
     log_level=str_env("FASTMCP_LOG_LEVEL", "INFO"),
     host=str_env("FASTMCP_HOST", "127.0.0.1"),
@@ -35,7 +38,7 @@ register_tools(server, session_store)
 
 
 def main() -> None:
-    """以 stdio 传输启动 MCP Server，并在退出时关闭所有会话。"""
+    """Run the server over stdio transport and close sessions on shutdown."""
     ensure_fastmcp_env()
     try:
         server.run(transport="stdio")
@@ -44,7 +47,7 @@ def main() -> None:
 
 
 def main_http() -> None:
-    """以 streamable-http 传输启动 MCP Server，并在退出时关闭所有会话。"""
+    """Run the server over streamable-http transport and close sessions on shutdown."""
     ensure_fastmcp_env()
     try:
         server.run(transport="streamable-http")

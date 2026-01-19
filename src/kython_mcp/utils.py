@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import yaml
 
@@ -27,11 +26,13 @@ _DEFAULT_SETTINGS = {
 
 
 def ensure_fastmcp_env() -> None:
+    """Populate default FastMCP environment settings if missing."""
     for key, value in _DEFAULT_SETTINGS.items():
         os.environ.setdefault(key, value)
 
 
 def format_blocks(blocks: list[tuple[str, str, object]]) -> str:
+    """Render a list of YAML blocks into a readable MCP response string."""
     sections = []
     for title, tag, payload in blocks:
         body = dump_yaml(payload).rstrip()
@@ -49,7 +50,7 @@ def dump_yaml(data: object) -> str:
 
 
 def str_presenter(dumper, data):
-    """强制多行字符串使用 YAML 的 | 样式，更易读"""
+    """Force multiline strings to use YAML literal block style."""
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)
@@ -59,9 +60,9 @@ yaml.add_representer(str, str_presenter)
 
 
 def precheck_syntax(code: str) -> None:
-    """在主进程侧进行语法预检，确保尽早失败。"""
+    """Validate code syntax early to fail fast."""
     if not isinstance(code, str):
-        raise ValueError("code 必须为字符串")
+        raise ValueError("Code must be a string")
     try:
         compile(code, "<mcp-client-code>", "single")
         return
@@ -71,8 +72,8 @@ def precheck_syntax(code: str) -> None:
         compile(code, "<mcp-client-code>", "exec")
     except SyntaxError as e:
         text = e.text or ""
-        where = f"第 {e.lineno} 行, 第 {e.offset} 列" if e.lineno else "未知位置"
-        msg = f"语法错误: {e.msg} ({where})\n{text}"
+        where = f"line {e.lineno}, column {e.offset}" if e.lineno else "unknown location"
+        msg = f"Syntax error: {e.msg} ({where})\n{text}"
         raise ValueError(msg) from e
 
 
