@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -355,28 +354,12 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         if not runner.is_running:
             raise RuntimeError("No running cell in this session")
 
-        def _unescape(s: str) -> str:
-            def repl(match: re.Match[str]) -> str:
-                token = match.group(1)
-                if token == "n":
-                    return "\n"
-                if token == "r":
-                    return "\r"
-                if token == "t":
-                    return "\t"
-                if token == "\\":
-                    return "\\"
-                if token.startswith("x"):
-                    return bytes.fromhex(token[1:]).decode("latin-1")
-                if token.startswith("u"):
-                    return chr(int(token[1:], 16))
-                if token.startswith("U"):
-                    return chr(int(token[1:], 16))
-                return match.group(0)
-
-            return re.sub(r"\\(\\|n|r|t|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})", repl, s)
-
-        decoded_keys = _unescape(keys or "")
+        decoded_keys = keys or ""
+        if decoded_keys:
+            try:
+                decoded_keys = eval(f'"{decoded_keys}"')
+            except Exception:
+                decoded_keys = keys
 
         payload = decoded_keys + ("\n" if append_newline else "")
         if payload:
