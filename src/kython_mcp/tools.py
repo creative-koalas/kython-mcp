@@ -354,7 +354,14 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         if not runner.is_running:
             raise RuntimeError("No running cell in this session")
 
-        payload = keys + ("\n" if append_newline else "")
+        decoded_keys = keys
+        if keys:
+            try:
+                decoded_keys = bytes(keys, "utf-8").decode("unicode_escape")
+            except Exception:
+                decoded_keys = keys
+
+        payload = decoded_keys + ("\n" if append_newline else "")
         if payload:
             runner.send_stdin(payload)
         if send_eof:
