@@ -17,3 +17,12 @@ logs/
 
 # Environment variables
 .env
+
+# build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+*.egg-info/
+
