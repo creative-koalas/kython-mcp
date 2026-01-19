@@ -355,8 +355,8 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         if decoded_keys:
             try:
                 decoded_keys = eval(f'"{decoded_keys}"')
-            except Exception:
-                decoded_keys = keys
+            except Exception as e:
+                raise ValueError(f"Failed to parse keys: {e}")
 
         if decoded_keys:
             runner.send_stdin(decoded_keys)
