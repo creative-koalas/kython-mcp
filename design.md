@@ -14,6 +14,13 @@ It offers:
 
 Each session runs in its own Python process. The parent process orchestrates sessions and routes stdin/stdout/stderr through structured messages, providing cell-level snapshots and cooperative interruption.
 
+The module layout mirrors kmux (thin server module + focused submodules):
+
+- `server.py`: MCP server wiring
+- `tools.py`: tool definitions
+- `sessions.py`: session lifecycle + registry
+- `utils.py`: env + formatting helpers
+
 ## API Design (kmux-style)
 
 The API mirrors kmux semantics so agents can reuse the same mental model.
