@@ -122,13 +122,13 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         return f"Session ID:{public_id} closed"
 
     @server.tool(
-        name="submit_command",
+        name="submit_cell",
         description=(
             "Execute Python code in a session (kmux-style). "
             "timeout_seconds<=0 returns immediately; >0 waits until completion."
         ),
     )
-    async def submit_command(
+    async def submit_cell(
         session_id: Annotated[str, Field(description="Target session ID.")],
         command: Annotated[str, Field(description="Python code to execute.")],
         timeout_seconds: Annotated[
@@ -151,31 +151,31 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         slog = record.logger
         try:
             logger.info(
-                "submit_command start client=%s session=%s",
+                "submit_cell start client=%s session=%s",
                 ctx.client_id,
                 internal_id,
             )
             slog.info(
-                "submit_command code_len=%d\ncode:\n%s",
+                "submit_cell code_len=%d\ncode:\n%s",
                 len(command or ""),
                 command,
             )
             cid = runner.start_cell(command)
         except BusyError as exc:
             logger.warning(
-                "submit_command busy client=%s session=%s",
+                "submit_cell busy client=%s session=%s",
                 ctx.client_id,
                 internal_id,
             )
-            slog.warning("submit_command busy, rejected")
+            slog.warning("submit_cell busy, rejected")
             raise RuntimeError(f"Session is busy: {exc}") from exc
         except Exception:
             logger.exception(
-                "submit_command error client=%s session=%s",
+                "submit_cell error client=%s session=%s",
                 ctx.client_id,
                 internal_id,
             )
-            slog.exception("submit_command exception")
+            slog.exception("submit_cell exception")
             raise
 
         if timeout_seconds is None:
@@ -190,14 +190,14 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 result = await runner.wait_cell(cid, timeout=wait_timeout)
             except asyncio.TimeoutError:
                 logger.info(
-                    "submit_command wait timeout client=%s session=%s cid=%s timeout=%s",
+                    "submit_cell wait timeout client=%s session=%s cid=%s timeout=%s",
                     ctx.client_id,
                     internal_id,
                     cid,
                     wait_timeout,
                 )
                 slog.info(
-                    "submit_command timeout cid=%s timeout=%s, continue in background",
+                    "submit_cell timeout cid=%s timeout=%s, continue in background",
                     cid,
                     wait_timeout,
                 )
@@ -230,12 +230,12 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 result_text = result.get("result") or ""
                 duration_seconds = result.get("duration_seconds")
                 logger.info(
-                    "submit_command completed client=%s session=%s cid=%s",
+                    "submit_cell completed client=%s session=%s cid=%s",
                     ctx.client_id,
                     internal_id,
                     cid,
                 )
-                slog.info("submit_command completed cid=%s", cid)
+                slog.info("submit_cell completed cid=%s", cid)
                 output_parts = []
                 if stdout_text:
                     output_parts.append(stdout_text)
@@ -258,12 +258,12 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 )
 
         logger.info(
-            "submit_command started client=%s session=%s cid=%s",
+            "submit_cell started client=%s session=%s cid=%s",
             ctx.client_id,
             internal_id,
             cid,
         )
-        slog.info("submit_command started cid=%s", cid)
+        slog.info("submit_cell started cid=%s", cid)
         return f"Command in Session ID:{record.public_id} Cell ID:{cid} started"
 
     @server.tool(
@@ -351,6 +351,12 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         runner = record.runner
         slog = record.logger
 
+        if not runner.is_running:
+            raise RuntimeError("No running cell in this session")
+
+        if "\x03" in keys:
+            runner.cancel_current_cell()
+
         payload = keys + ("\n" if append_newline else "")
         if payload:
             runner.send_stdin(payload)
@@ -378,6 +384,7 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             "append_newline": append_newline,
             "eof_sent": send_eof,
         }
+
         return f"Send keys to Session ID:{record.public_id}\n" + format_blocks(
             [("stdin payload:", "stdin", stdin_info)]
         )

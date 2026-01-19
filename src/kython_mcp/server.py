@@ -16,7 +16,7 @@ session_store = InterpreterSessionStore()
 server = FastMCP(
     name="Kython Process Interpreter",
     instructions=(
-        "Use create_session to spawn a Python session, submit_command to execute code, "
+        "Use create_session to spawn a Python session, submit_cell to execute code, "
         "and snapshot to fetch cell outputs."
     ),
     debug=bool_env("FASTMCP_DEBUG", "false"),

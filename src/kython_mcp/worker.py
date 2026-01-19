@@ -1,3 +1,4 @@
+import ctypes
 import json
 import queue
 import sys
@@ -97,6 +98,37 @@ class _QueueReader:
 
     def close(self) -> None:
         self._eof = True
+
+
+
+def _async_raise(thread_id: int | None, exc_type: type[BaseException]) -> None:
+    if not thread_id:
+        return
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_long(thread_id), ctypes.py_object(exc_type)
+    )
+    if res == 0:
+        return
+    if res > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+
+
+_original_sleep = time.sleep
+
+
+def _cancellable_sleep(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    end_time = time.monotonic() + seconds
+    while True:
+        cancel_flag.check()
+        remaining = end_time - time.monotonic()
+        if remaining <= 0:
+            break
+        _original_sleep(min(0.1, remaining))
+
+
+time.sleep = _cancellable_sleep
 
 
 class _CancelFlag:
@@ -205,6 +237,8 @@ def main() -> None:
             stdin_queue.put({"type": "stdin_eof"})
         elif kind == "cancel":
             cancel_flag.request()
+            if state.thread:
+                _async_raise(state.thread.ident, KeyboardInterrupt)
         elif kind == "close":
             break
 

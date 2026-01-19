@@ -47,8 +47,8 @@ The API mirrors kmux semantics so agents can reuse the same mental model.
   - **Input**: `session_id: string`, `description?: string`
   - **Output**: `"Session ID:{id} description updated to:{description}"`
 
-- **submit_command**
-  - **Purpose**: Execute Python code (like kmux submit_command)
+- **submit_cell**
+  - **Purpose**: Execute Python code (like kmux submit_cell)
   - **Input**: `session_id: string`, `command: string`, `timeout_seconds?: number`
   - **Behavior**:
     - `timeout_seconds <= 0 or None`: return immediately with cell_id
