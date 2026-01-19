@@ -320,7 +320,13 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         blocks = [
             (f"Cell {info['cell_id']} snapshot", "result", info) for info in cell_infos
         ]
-        return f"Session ID:{record.public_id} snapshot\n" + format_blocks(blocks)
+        snapshot_text = format_blocks(blocks)
+        header = (
+            "Terminal snapshot (including all outputs):"
+            if include_all
+            else "Terminal snapshot (starting from last command input):"
+        )
+        return f"{header}\n<snapshot>\n{snapshot_text}\n</snapshot>"
 
     @server.tool(
         name="send_keys",
