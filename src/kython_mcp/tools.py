@@ -354,9 +354,6 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         if not runner.is_running:
             raise RuntimeError("No running cell in this session")
 
-        if "\x03" in keys:
-            runner.cancel_current_cell()
-
         payload = keys + ("\n" if append_newline else "")
         if payload:
             runner.send_stdin(payload)
