@@ -218,7 +218,6 @@ def session_payload(record: SessionRecord) -> dict[str, Any]:
         "metadata": {
             "label": record.label,
             "description": record.description,
-            "running": record.runner.is_running,
             "running_cell": running_snippet,
             "python_executable": record.python_executable,
         },

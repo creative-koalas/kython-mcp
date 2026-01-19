@@ -306,7 +306,6 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                 {
                     "cell_id": snap["cell_id"],
                     "running": bool(snap["running"]),
-                    "done": bool(snap["done"]),
                     "source": source_text,
                     "stdout": stdout_text,
                     "stderr": stderr_text,
@@ -327,9 +326,9 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         ]
         snapshot_text = format_blocks(blocks)
         header = (
-            "Terminal snapshot (including all outputs):"
+            "Session snapshot (including all outputs):"
             if include_all
-            else "Terminal snapshot (starting from last command input):"
+            else "Session snapshot (starting from last command input):"
         )
         return f"{header}\n<snapshot>\n{snapshot_text}\n</snapshot>"
 
@@ -340,10 +339,6 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
     async def send_keys(
         session_id: Annotated[str, Field(description="Target session ID.")],
         keys: Annotated[str, Field(description="Payload to send (supports escapes).")],
-        append_newline: Annotated[
-            bool, Field(description="Append newline after payload.")
-        ] = False,
-        send_eof: Annotated[bool, Field(description="Send EOF after payload.")] = False,
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
@@ -363,32 +358,23 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
             except Exception:
                 decoded_keys = keys
 
-        payload = decoded_keys + ("\n" if append_newline else "")
-        if payload:
-            runner.send_stdin(payload)
-        if send_eof:
-            runner.send_stdin_eof()
+        if decoded_keys:
+            runner.send_stdin(decoded_keys)
 
         logger.info(
-            "send_keys client=%s session=%s len=%d newline=%s eof=%s",
+            "send_keys client=%s session=%s len=%d",
             ctx.client_id,
             internal_id,
             len(keys or ""),
-            append_newline,
-            send_eof,
         )
         slog.info(
-            "send_keys len=%d newline=%s eof=%s\npayload:\n%s",
+            "send_keys len=%d\npayload:\n%s",
             len(keys or ""),
-            append_newline,
-            send_eof,
             keys,
         )
         stdin_info = {
             "length": len(keys or ""),
             "content": keys,
-            "append_newline": append_newline,
-            "eof_sent": send_eof,
         }
 
         return f"Send keys to Session ID:{record.public_id}\n" + format_blocks(
