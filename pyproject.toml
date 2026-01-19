@@ -1,9 +1,9 @@
 [project]
 name = "kython-mcp"
 version = "0.1.0"
-description = "Python interpreter MCP server with subinterpreter-based REPL"
+description = "Python interpreter MCP server with process-based sessions"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",

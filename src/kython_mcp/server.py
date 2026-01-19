@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,25 +16,46 @@ from .local_log import get_logger, get_session_logger
 
 logger = get_logger("kython_mcp.server")
 
+_DEFAULT_SETTINGS = {
+    "FASTMCP_DEBUG": "false",
+    "FASTMCP_LOG_LEVEL": "INFO",
+    "FASTMCP_HOST": "127.0.0.1",
+    "FASTMCP_PORT": "8000",
+    "FASTMCP_MOUNT_PATH": "/",
+    "FASTMCP_SSE_PATH": "/sse",
+    "FASTMCP_MESSAGE_PATH": "/messages/",
+    "FASTMCP_STREAMABLE_HTTP_PATH": "/mcp",
+    "FASTMCP_JSON_RESPONSE": "true",
+    "FASTMCP_STATELESS_HTTP": "false",
+    "FASTMCP_WARN_ON_DUPLICATE_RESOURCES": "false",
+    "FASTMCP_WARN_ON_DUPLICATE_TOOLS": "false",
+    "FASTMCP_WARN_ON_DUPLICATE_PROMPTS": "false",
+    "FASTMCP_DEPENDENCIES": "[]",
+    "FASTMCP_LIFESPAN": "null",
+    "FASTMCP_AUTH": "null",
+    "FASTMCP_TRANSPORT_SECURITY": "null",
+}
+
+
+def _ensure_fastmcp_env() -> None:
+    for key, value in _DEFAULT_SETTINGS.items():
+        os.environ.setdefault(key, value)
+
 
 def str_presenter(dumper, data):
     """强制多行字符串使用 YAML 的 | 样式，更易读"""
-    if '\n' in data:
-        # style='|' 保留换行，style='>' 折叠换行
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
-    return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
 
 yaml.add_representer(str, str_presenter)
 
-def _precheck_syntax(code: str) -> None:
-    """在主进程侧进行语法预检，确保尽早失败。
 
-    策略与子解释器保持一致：优先尝试 "single"，失败再尝试 "exec"。
-    若两者均失败，抛出包含行列与上下文的 ValueError。
-    """
+def _precheck_syntax(code: str) -> None:
+    """在主进程侧进行语法预检，确保尽早失败。"""
     if not isinstance(code, str):
         raise ValueError("code 必须为字符串")
-    # 允许空字符串/空白：不视为语法错误
     try:
         compile(code, "<mcp-client-code>", "single")
         return
@@ -49,14 +71,12 @@ def _precheck_syntax(code: str) -> None:
 
 
 def _dump_yaml(data: object) -> str:
-    dumped = yaml.dump(
+    return yaml.dump(
         data,
         allow_unicode=True,
         sort_keys=False,
         indent=2,
     )
-    return dumped
-    # return dumped.replace("\n\n", "\n")
 
 
 class StartCellResult(BaseModel):
@@ -99,6 +119,7 @@ class _SessionRecord:
     ctx_key: int
     public_id: str
     description: str | None = None
+    python_executable: str | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -108,6 +129,7 @@ def _session_payload(record: _SessionRecord) -> dict[str, Any]:
         "metadata": {
             "description": record.description,
             "running": record.runner.is_running,
+            "python_executable": record.python_executable,
         },
     }
 
@@ -116,7 +138,7 @@ def _format_blocks(blocks: list[tuple[str, str, object]]) -> str:
     sections = []
     for title, tag, payload in blocks:
         body = _dump_yaml(payload).rstrip()
-        sections.append(f"{title}\n<{tag}>\n{body}\n<{tag}\>")
+        sections.append(f"{title}\n<{tag}>\n{body}\n</{tag}>")
     return "\n\n".join(sections)
 
 
@@ -131,7 +153,10 @@ class InterpreterSessionStore:
         self._lock = asyncio.Lock()
 
     async def create_session(
-        self, ctx: Context, description: str | None = None
+        self,
+        ctx: Context,
+        description: str | None = None,
+        python_executable: str | None = None,
     ) -> tuple[str, _SessionRecord]:
         key = self._session_key(ctx)
         async with self._lock:
@@ -141,13 +166,18 @@ class InterpreterSessionStore:
             public_id = str(counter)
             session_name = f"session-{public_id}"
             loop = asyncio.get_running_loop()
-            runner = AsyncInterpreterRunner(name=session_name, loop=loop)
+            runner = AsyncInterpreterRunner(
+                name=session_name,
+                loop=loop,
+                python_executable=python_executable,
+            )
             record = _SessionRecord(
                 runner=runner,
                 logger=get_session_logger(session_name),
                 ctx_key=key,
                 public_id=public_id,
                 description=description,
+                python_executable=python_executable,
                 created_at=time.time(),
             )
             self._sessions[session_id] = record
@@ -191,7 +221,11 @@ class InterpreterSessionStore:
         internal_id, record = await self.get_session(ctx, session_id)
         loop = asyncio.get_running_loop()
         runner_label = f"session-{record.public_id}"
-        new_runner = AsyncInterpreterRunner(name=runner_label, loop=loop)
+        new_runner = AsyncInterpreterRunner(
+            name=runner_label,
+            loop=loop,
+            python_executable=record.python_executable,
+        )
         await record.runner.aclose()
         new_record = _SessionRecord(
             runner=new_runner,
@@ -199,13 +233,12 @@ class InterpreterSessionStore:
             ctx_key=record.ctx_key,
             public_id=record.public_id,
             description=record.description,
+            python_executable=record.python_executable,
             created_at=record.created_at,
         )
         async with self._lock:
             self._sessions[internal_id] = new_record
-        logger.info(
-            "reset_session session_id=%s ctx_key=%s", internal_id, record.ctx_key
-        )
+        logger.info("reset_session session_id=%s ctx_key=%s", internal_id, record.ctx_key)
         return internal_id, new_record
 
     async def close_session(self, ctx: Context, session_id: str) -> tuple[str, str]:
@@ -262,27 +295,56 @@ class InterpreterSessionStore:
 
 session_store = InterpreterSessionStore()
 
+_ensure_fastmcp_env()
+
 server = FastMCP(
-    name="Kython Subinterpreter",
+    name="Kython Process Interpreter",
     instructions="使用 create_python_session 创建多个独立 Python session，start_python_cell 异步执行代码，并通过快照/事件轮询结果。",
+    debug=os.environ.get("FASTMCP_DEBUG", "false").lower() == "true",
+    log_level=os.environ.get("FASTMCP_LOG_LEVEL", "INFO"),
+    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("FASTMCP_PORT", "8000")),
+    mount_path=os.environ.get("FASTMCP_MOUNT_PATH", "/"),
+    sse_path=os.environ.get("FASTMCP_SSE_PATH", "/sse"),
+    message_path=os.environ.get("FASTMCP_MESSAGE_PATH", "/messages/"),
+    streamable_http_path=os.environ.get("FASTMCP_STREAMABLE_HTTP_PATH", "/mcp"),
+    json_response=os.environ.get("FASTMCP_JSON_RESPONSE", "false").lower() == "true",
+    stateless_http=os.environ.get("FASTMCP_STATELESS_HTTP", "false").lower() == "true",
+    warn_on_duplicate_resources=os.environ.get("FASTMCP_WARN_ON_DUPLICATE_RESOURCES", "true").lower() == "true",
+    warn_on_duplicate_tools=os.environ.get("FASTMCP_WARN_ON_DUPLICATE_TOOLS", "true").lower() == "true",
+    warn_on_duplicate_prompts=os.environ.get("FASTMCP_WARN_ON_DUPLICATE_PROMPTS", "true").lower() == "true",
 )
 
 
 def main() -> None:
     """以 stdio 传输启动 MCP Server，并在退出时关闭所有会话。"""
+    _ensure_fastmcp_env()
     try:
         server.run(transport="stdio")
     finally:
         asyncio.run(session_store.close_all())
 
 
+def main_http() -> None:
+    """以 streamable-http 传输启动 MCP Server，并在退出时关闭所有会话。"""
+    _ensure_fastmcp_env()
+    try:
+        server.run(transport="streamable-http")
+    finally:
+        asyncio.run(session_store.close_all())
+
+
 @server.tool(
     name="create_python_session",
-    description="创建一个新的 Python 子解释器 session，并返回 session_id。",
+    description="创建一个新的 Python 解释器 session，并返回 session_id。支持指定 python_executable。",
 )
 async def create_python_session(
     description: Annotated[
         str | None, Field(description="可选的 session 描述信息，方便区分用途")
+    ] = None,
+    python_executable: Annotated[
+        str | None,
+        Field(description="可选 Python 可执行路径，用于指定不同环境"),
     ] = None,
     ctx: Context | None = None,
 ) -> str:
@@ -290,7 +352,7 @@ async def create_python_session(
         raise ValueError("Context 注入失败")
 
     internal_id, record = await session_store.create_session(
-        ctx, description=description
+        ctx, description=description, python_executable=python_executable
     )
     record.logger.info(
         "create_python_session description=%s session_id=%s",
@@ -340,9 +402,9 @@ async def list_python_sessions(ctx: Context | None = None) -> str:
     sessions = await session_store.list_sessions(ctx)
     logger.info("list_python_sessions client=%s count=%d", ctx.client_id, len(sessions))
     session_entries = [_session_payload(record) for _, record in sessions]
-    return _format_blocks(
-        [("Current active python sessions:", "sessions", session_entries)]
-    )
+    return _format_blocks([
+        ("Current active python sessions:", "sessions", session_entries)
+    ])
 
 
 @server.tool(
@@ -377,7 +439,6 @@ async def start_python_cell(
     if ctx is None:
         raise ValueError("Context 注入失败")
 
-    # 语法预检：发现语法问题直接返回错误
     _precheck_syntax(code)
 
     internal_id, record = await session_store.get_session(ctx, session_id)
@@ -387,9 +448,7 @@ async def start_python_cell(
         logger.info(
             "start_python_cell start client=%s session=%s", ctx.client_id, internal_id
         )
-        slog.info(
-            "调用 start_python_cell, 代码长度=%d\n代码:\n%s", len(code or ""), code
-        )
+        slog.info("调用 start_python_cell, 代码长度=%d\n代码:\n%s", len(code or ""), code)
         cid = runner.start_cell(code)
     except BusyError as exc:
         logger.warning(
@@ -403,10 +462,11 @@ async def start_python_cell(
         )
         slog.exception("start_python_cell 异常")
         raise
+
     wait_timeout = None
     if timeout is not None and timeout > 0:
         wait_timeout = timeout
-    cell_info: dict[str, Any]
+
     if wait_timeout:
         try:
             result = await runner.wait_cell(cid, timeout=wait_timeout)
@@ -418,21 +478,11 @@ async def start_python_cell(
                 cid,
                 wait_timeout,
             )
-            slog.info(
-                "start_python_cell 超时，cid=%s timeout=%s，后台继续运行",
-                cid,
-                wait_timeout,
-            )
-            cell_info = {
-                "cell_id": cid,
-                "status": "running",
-                "timed_out": True,
-            }
-            return f"Code in Session ID:{record.public_id} Cell ID:{cid} timeout,but still running in background"
+            slog.info("start_python_cell 超时，cid=%s timeout=%s，后台继续运行", cid, wait_timeout)
+            return f"Code in Session ID:{record.public_id} Cell ID:{cid} timeout, but still running in background"
         else:
             stdout_text = result.get("stdout") or ""
             stderr_text = result.get("stderr") or ""
-            result_text = result.get("result") or ""
             exception_text = result.get("exception")
             logger.info(
                 "start_python_cell completed client=%s session=%s cid=%s",
@@ -446,29 +496,17 @@ async def start_python_cell(
                 "status": "completed",
                 "stdout": stdout_text,
                 "stderr": stderr_text,
-                # "result": result_text,
                 "exception": exception_text,
             }
 
             return (
                 f"Code in Session ID:{record.public_id}Cell ID:{cid} complete:\n"
-                + _format_blocks(
-                    [
-                        ("Cell Result", "result", cell_info),
-                    ]
-                )
+                + _format_blocks([("Cell Result", "result", cell_info)])
             )
 
-    else:
-        logger.info(
-            "start_python_cell started client=%s session=%s cid=%s",
-            ctx.client_id,
-            internal_id,
-            cid,
-        )
-        slog.info("start_python_cell 已启动 cid=%s", cid)
-        cell_info = {"cell_id": cid, "status": "running"}
-        return f"Code in Session ID:{record.public_id}Cell ID:{cid} started"
+    logger.info("start_python_cell started client=%s session=%s cid=%s", ctx.client_id, internal_id, cid)
+    slog.info("start_python_cell 已启动 cid=%s", cid)
+    return f"Code in Session ID:{record.public_id}Cell ID:{cid} started"
 
 
 @server.tool(
@@ -479,16 +517,13 @@ async def get_python_cell_snapshot(
     session_id: Annotated[str, Field(description="要查询的 session ID")],
     cell_id: Annotated[
         int | None,
-        Field(
-            description="可选指定 cell_id；为空则优先返回当前活动 cell，否则返回最近完成者"
-        ),
+        Field(description="可选指定 cell_id；为空则优先返回当前活动 cell，否则返回最近完成者"),
     ] = None,
     n_cells: Annotated[
         int | None,
         Field(
             description=(
-                "查询最近的 n 个 cell 快照，仅在未指定 cell_id 时生效；"
-                "为空则返回全部 cell"
+                "查询最近的 n 个 cell 快照，仅在未指定 cell_id 时生效；为空则返回全部 cell"
             )
         ),
     ] = None,
@@ -527,7 +562,7 @@ async def get_python_cell_snapshot(
                 "done": bool(snap["done"]),
                 "stdout": stdout_text,
                 "stderr": stderr_text,
-                # "result": result_text,
+                "result": result_text,
                 "exception": exception_text,
             }
         )
@@ -602,9 +637,7 @@ async def send_python_stdin(
     }
 
     return f"Send stdin to Session ID:{record.public_id}\n" + _format_blocks(
-        [
-            ("stdin payload:", "stdin", stdin_info),
-        ]
+        [("stdin payload:", "stdin", stdin_info)]
     )
 
 
@@ -645,12 +678,12 @@ async def cancel_python_cell(
                 "Cancel result:",
                 "state",
                 {"state": "running", "interrupt_acknowledged": success},
-            ),
+            )
         ]
     )
 
 
-__all__ = ["server", "main"]
+__all__ = ["server", "main", "main_http"]
 
 
 if __name__ == "__main__":
