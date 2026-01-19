@@ -2,41 +2,74 @@
 
 ## What is kython-mcp?
 
-kython-mcp (koala + python = kython)
-is a Python interpreter MCP server designed for LLM and agentic systems.
+kython-mcp (koala + python = kython) is a Python interpreter MCP server designed for LLM and agentic systems.
 
 It offers:
 
-- Multiple Python interpreter sessions with virtualized, independent stdin/stdout/stderr
-- Block-delimited execution
-- Specifying custom Python interpreter executable for custom environments
+- Multiple Python interpreter sessions with isolated stdin/stdout/stderr
+- Block-delimited execution (cell-based)
+- Optional custom Python executable per session
 
 ## Architecture
 
-The most important piece of the puzzle is
-how to effectively handle multiple Python interpreter sessions
-with independent stdin/stdout/stderr,
-and to capture them in a robust way.
-Specifically, it is crucial to find a way to handle stdin correctly.
+Each session runs in its own Python process. The parent process orchestrates sessions and routes stdin/stdout/stderr through structured messages, providing cell-level snapshots and cooperative interruption.
 
-We will use a single-process architecture with subinterpreters.
-Concretely, we will create channels in the "master interpreter" for communication,
-then override `sys.stdin`, `sys.stdout`, and `sys.stderr` in each subinterpreter.
-We'll send JSON messages instead of raw strings over the channels;
-this makes it easy to see the boundaries of each command execution.
+## API Design (kmux-style)
 
-## Features
+The API mirrors kmux semantics so agents can reuse the same mental model.
 
-`kython-mcp` offers the following features:
+### Tools
 
-- Cell-based execution:
-executions and outputs are automatically segmented into cells;
-this makes it easy to see which code produced which output.
-This is done by sending markers at specific points
-(e.g., before execution, after execution, etc.)
-to the message channels in the subinterpreters.
-- Interruption (cooperative):
-Cells that take too long to execute can be interrupted.
+- **create_session**
+  - **Purpose**: Create a new Python session (like kmux create_session)
+  - **Input**: `label?: string`, `description?: string`, `python_executable?: string`
+  - **Output**: `"New session created, ID:{id}"`
 
-The design philosophy of `kython-mcp` is similar to that of [`kmux`](https://github.com/creative-koalas/kmux.git);
-block-oriented execution, AI-friendly ergonomics, etc.
+- **list_sessions**
+  - **Purpose**: List active sessions (like kmux list_sessions)
+  - **Input**: none
+  - **Output**: YAML block with `id`, `metadata.label`, `metadata.description`, `metadata.running`, `metadata.python_executable`
+
+- **update_session_label**
+  - **Purpose**: Update session label (like kmux update_session_label)
+  - **Input**: `session_id: string`, `label?: string`
+  - **Output**: `"Session ID:{id} label updated to:{label}"`
+
+- **update_session_description**
+  - **Purpose**: Update session description (like kmux update_session_description)
+  - **Input**: `session_id: string`, `description?: string`
+  - **Output**: `"Session ID:{id} description updated to:{description}"`
+
+- **submit_command**
+  - **Purpose**: Execute Python code (like kmux submit_command)
+  - **Input**: `session_id: string`, `command: string`, `timeout_seconds?: number`
+  - **Behavior**:
+    - `timeout_seconds <= 0 or None`: return immediately with cell_id
+    - `timeout_seconds > 0`: wait for completion, return result; if timeout, continues in background
+  - **Output**:
+    - Started: `"Command in Session ID:{id} Cell ID:{cid} started"`
+    - Completed: YAML block with stdout/stderr/exception
+    - Timeout: `"... timeout, but still running in background"`
+
+- **snapshot**
+  - **Purpose**: Get cell output snapshot (like kmux snapshot)
+  - **Input**: `session_id: string`, `include_all?: boolean`
+  - **Behavior**:
+    - `include_all=false` returns latest cell only
+    - `include_all=true` returns all cells
+  - **Output**: YAML blocks with stdout/stderr/result/exception
+
+- **send_keys**
+  - **Purpose**: Send input to stdin (like kmux send_keys)
+  - **Input**: `session_id: string`, `keys: string`, `append_newline?: boolean`, `send_eof?: boolean`
+  - **Output**: YAML block with stdin payload
+
+- **delete_session**
+  - **Purpose**: Close and remove a session (like kmux delete_session)
+  - **Input**: `session_id: string`
+  - **Output**: `"Session ID:{id} closed"`
+
+## Notes
+
+- Cell outputs are segmented to make reasoning easier.
+- Interrupts are handled by sending control sequences via `send_keys` (e.g. `\x03`).
