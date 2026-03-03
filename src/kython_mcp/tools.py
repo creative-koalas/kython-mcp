@@ -220,8 +220,9 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
                     "Current command output:\n\n"
                     f"<command-output>\n{output}\n</command-output>\n\n"
                     "It is recommended to use `snapshot` on this session later to see command status,\n"
-                    "and use `send_keys` to interact with the session if necessary.\n"
-                    "You cannot execute another command on this session until the current command finishes or get terminated."
+                    "use `send_keys` to provide input if the command is awaiting it, "
+                    "or `interrupt_cell` to stop the command.\n"
+                    "You cannot execute another command on this session until the current command finishes or is interrupted."
                 )
             else:
                 stdout_text = result.get("stdout") or ""
@@ -334,11 +335,16 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
 
     @server.tool(
         name="send_keys",
-        description="Send data to Python stdin (kmux-style).",
+        description=(
+            "Send input data to a session's stdin. "
+            "Use this to answer interactive prompts (e.g. input()). "
+            "Supports Python escape sequences (e.g. \\n for newline). "
+            "To interrupt a running cell, use `interrupt_cell` instead."
+        ),
     )
     async def send_keys(
         session_id: Annotated[str, Field(description="Target session ID.")],
-        keys: Annotated[str, Field(description="Payload to send (supports escapes).")],
+        keys: Annotated[str, Field(description="Input text to send (supports escape sequences like \\n).")],
         ctx: Context | None = None,
     ) -> str:
         if ctx is None:
@@ -380,3 +386,35 @@ def register_tools(server: FastMCP, session_store: InterpreterSessionStore) -> N
         return f"Send keys to Session ID:{record.public_id}\n" + format_blocks(
             [("stdin payload:", "stdin", stdin_info)]
         )
+
+    @server.tool(
+        name="interrupt_cell",
+        description=(
+            "Interrupt the currently running cell in a session (sends SIGINT). "
+            "Use this to stop long-running or stuck operations like infinite loops, "
+            "slow computations, or blocking calls (e.g. time.sleep)."
+        ),
+    )
+    async def interrupt_cell(
+        session_id: Annotated[str, Field(description="Target session ID.")],
+        ctx: Context | None = None,
+    ) -> str:
+        if ctx is None:
+            raise ValueError("Context injection failed")
+
+        internal_id, record = await session_store.get_session(ctx, session_id)
+        runner = record.runner
+        slog = record.logger
+
+        if not runner.is_running:
+            raise RuntimeError("No running cell in this session")
+
+        runner.cancel_current_cell()
+
+        logger.info(
+            "interrupt_cell client=%s session=%s",
+            ctx.client_id,
+            internal_id,
+        )
+        slog.info("interrupt_cell")
+        return f"Interrupt signal sent to Session ID:{record.public_id}"

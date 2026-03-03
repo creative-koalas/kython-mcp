@@ -1,5 +1,7 @@
 import json
+import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -99,31 +101,12 @@ class _QueueReader:
         self._eof = True
 
 
-class _CancelFlag:
-    def __init__(self) -> None:
-        self._event = threading.Event()
-
-    def request(self) -> None:
-        self._event.set()
-
-    def clear(self) -> None:
-        self._event.clear()
-
-    def check(self) -> None:
-        if self._event.is_set():
-            raise KeyboardInterrupt("Execution cancelled")
-
-
-class _ExecutionState:
-    def __init__(self) -> None:
-        self.running = False
-        self.cell_id = 0
-        self.thread: threading.Thread | None = None
-
-
-cancel_flag = _CancelFlag()
 stdin_queue: queue.Queue = queue.Queue()
-state = _ExecutionState()
+# Delivers cell-run requests from the reader thread to the main thread.
+cell_queue: queue.Queue = queue.Queue()
+# Signals the reader thread that the main thread is ready for a new cell.
+cell_idle = threading.Event()
+cell_idle.set()
 _globals = {"__name__": "__main__", "__package__": None}
 
 sys.stdout = _QueueWriter("stdout")
@@ -140,27 +123,17 @@ sys.stdin = _QueueReader(stdin_queue)
 
 
 def _run_cell(cell_id: int, source: str) -> None:
-    cancel_flag.clear()
+    cell_idle.clear()
     _send({"type": "cell_start", "cell_id": cell_id})
     t0 = time.perf_counter()
     exc_text = None
 
     try:
-        cancel_flag.check()
         try:
             code = compile(source, "<cell>", "single")
         except SyntaxError:
             code = compile(source, "<cell>", "exec")
-
-        def _trace(frame, event, arg):
-            cancel_flag.check()
-            return _trace
-
-        sys.settrace(_trace)
-        try:
-            exec(code, _globals, _globals)
-        finally:
-            sys.settrace(None)
+        exec(code, _globals, _globals)
     except BaseException as exc:
         exc_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
@@ -173,21 +146,11 @@ def _run_cell(cell_id: int, source: str) -> None:
             "timing_ms": round(dt_ms, 3),
         }
     )
-    state.running = False
-    state.thread = None
-    cancel_flag.clear()
+    cell_idle.set()
 
 
-def _start_cell(cell_id: int, source: str) -> None:
-    if state.running:
-        _send({"type": "cell_rejected", "cell_id": cell_id, "reason": "busy"})
-        return
-    state.running = True
-    state.thread = threading.Thread(target=_run_cell, args=(cell_id, source), daemon=True)
-    state.thread.start()
-
-
-def main() -> None:
+def _reader_loop() -> None:
+    """Background thread: read control messages from parent and dispatch."""
     control_in = sys.__stdin__
     for raw in control_in:
         if not raw.strip():
@@ -198,15 +161,29 @@ def main() -> None:
             continue
         kind = msg.get("type")
         if kind == "run_cell":
-            _start_cell(int(msg.get("cell_id")), msg.get("source", ""))
+            if not cell_idle.is_set():
+                _send({"type": "cell_rejected", "cell_id": msg.get("cell_id"), "reason": "busy"})
+            else:
+                cell_queue.put(msg)
         elif kind == "stdin":
             stdin_queue.put({"type": "stdin", "chunk": msg.get("chunk", "")})
         elif kind == "stdin_eof":
             stdin_queue.put({"type": "stdin_eof"})
         elif kind == "cancel":
-            cancel_flag.request()
+            os.kill(os.getpid(), signal.SIGINT)
         elif kind == "close":
+            cell_queue.put(None)  # Sentinel to stop the main loop.
             break
+
+
+def main() -> None:
+    reader = threading.Thread(target=_reader_loop, daemon=True)
+    reader.start()
+
+    # Cells execute in the main thread so that SIGINT naturally raises
+    # KeyboardInterrupt, interrupting even C-level blocking calls.
+    for msg in iter(cell_queue.get, None):
+        _run_cell(int(msg.get("cell_id")), msg.get("source", ""))
 
 
 if __name__ == "__main__":
