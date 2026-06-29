@@ -6,6 +6,7 @@ __pycache__/
 *.py[oc]
 build/
 dist/
+dist-protected/
 wheels/
 *.egg-info
 olds/

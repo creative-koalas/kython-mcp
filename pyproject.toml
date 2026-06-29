@@ -19,6 +19,21 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/kython_mcp"]
 
+[tool.protected-artifacts]
+cython-targets = [
+    "src/kython_mcp/interpreter_runner.py",
+    "src/kython_mcp/local_log.py",
+    "src/kython_mcp/sessions.py",
+    "src/kython_mcp/utils.py",
+]
+plaintext-runtime-py = [
+    "src/kython_mcp/__init__.py",
+    "src/kython_mcp/__main__.py",
+    "src/kython_mcp/server.py",
+    "src/kython_mcp/tools.py",
+    "src/kython_mcp/worker.py",
+]
+
 [dependency-groups]
 dev = [
     "ipython>=9.7.0",
