@@ -39,6 +39,7 @@ class NativePythonService:
         self._lock = asyncio.Lock()
         self._execution_lock = asyncio.Lock()
         self._executions = ExecutionStore(receipt_path)
+        self._submitting: set[str] = set()
         self._running: dict[str, tuple[_Session, int]] = {}
         self._completion_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -196,6 +197,7 @@ class NativePythonService:
                     "meta": meta or {},
                 }
                 if self._executions.reserve(execution_id, fingerprint, receipt):
+                    self._submitting.add(execution_id)
                     owned_session = None
                     watcher_started = False
                     try:
@@ -219,10 +221,13 @@ class NativePythonService:
                         self._executions.update(execution_id, receipt)
                         raise
                     finally:
-                        if not watcher_started:
-                            self._running.pop(execution_id, None)
-                            if owned_session is not None:
-                                await self._release_session(owned_session)
+                        try:
+                            if not watcher_started:
+                                self._running.pop(execution_id, None)
+                                if owned_session is not None:
+                                    await self._release_session(owned_session)
+                        finally:
+                            self._submitting.discard(execution_id)
         return await self.execution(execution_id, wait_seconds=wait_seconds)
 
     async def execution(
@@ -246,9 +251,9 @@ class NativePythonService:
             except ValueError:
                 # The worker exited without a final cell result, before its watcher resumed.
                 receipt.update(state="unknown", cell=None)
-        elif receipt["state"] == "running":
-            # The owner finished but its terminal receipt could not be persisted.
-            # There is no live execution to wait for and the durable result is unknown.
+        elif receipt["state"] in {"accepted", "running"} and execution_id not in self._submitting:
+            # Submission or execution ended without persisting a final receipt.
+            # No live owner remains to wait for; the durable outcome is unknown.
             receipt.update(state="unknown", cell=None)
         cell = receipt["cell"]
         if (

@@ -127,6 +127,50 @@ async def test_one_shot_owner_is_released_when_submission_or_persistence_fails(
 
 
 @pytest.mark.asyncio
+async def test_continuous_receipt_update_failure_ends_submission_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    execution_id = str(uuid4())
+    source = "print('one shot')"
+    creating = asyncio.Event()
+    release_create = asyncio.Event()
+    runners = []
+    create = service._create_session
+
+    async def gated_create(**kwargs):
+        creating.set()
+        await release_create.wait()
+        session = await create(**kwargs)
+        runners.append(session.runner)
+        return session
+
+    def fail_update(*args):
+        raise OSError("receipt storage remains unavailable")
+
+    monkeypatch.setattr(service, "_create_session", gated_create)
+    monkeypatch.setattr(service._executions, "update", fail_update)
+    submission = asyncio.create_task(service.execute(execution_id, source, wait_seconds=0))
+    try:
+        await asyncio.wait_for(creating.wait(), timeout=2)
+        assert (await service.execution(execution_id))["state"] == "accepted"
+        release_create.set()
+        with pytest.raises(OSError, match="storage remains unavailable"):
+            await submission
+        assert not service._submitting and not service._running and not service._sessions
+        assert not service._completion_tasks
+        assert len(runners) == 1 and runners[0]._proc.poll() is not None
+        assert service._executions.get(execution_id)[1]["state"] == "accepted"
+        assert (await service.execution(execution_id))["state"] == "unknown"
+        assert (await service.execute(execution_id, source))["state"] == "unknown"
+        assert len(runners) == 1
+    finally:
+        release_create.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_bounded_receipt_wait_and_cancel_do_not_replay_or_interrupt(tmp_path: Path) -> None:
     service = NativePythonService(receipt_path=tmp_path / "receipts.db")
     execution_id = str(uuid4())
