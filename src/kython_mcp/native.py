@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
+from .executions import ExecutionStore
 from .interpreter_runner import AsyncInterpreterRunner, BusyError
 from .utils import precheck_syntax
 
@@ -28,12 +33,19 @@ class _Session:
 class NativePythonService:
     """Own Python interpreter sessions for one workspace process."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, receipt_path: Path | None = None) -> None:
         self._sessions: dict[str, _Session] = {}
-        self._next_session_id = 1
         self._lock = asyncio.Lock()
+        self._execution_lock = asyncio.Lock()
+        self._executions = ExecutionStore(receipt_path)
+        self._running: dict[str, tuple[_Session, int]] = {}
+        self._completion_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def close(self) -> None:
+        tasks = list(self._completion_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -41,6 +53,7 @@ class NativePythonService:
             *(session.runner.aclose() for session in sessions),
             return_exceptions=True,
         )
+        self._executions.close()
 
     async def create_session(
         self,
@@ -49,8 +62,7 @@ class NativePythonService:
         description: str | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
-            session_id = str(self._next_session_id)
-            self._next_session_id += 1
+            session_id = uuid4().hex
             runner = AsyncInterpreterRunner(
                 name=f"session-{session_id}",
                 loop=asyncio.get_running_loop(),
@@ -104,7 +116,7 @@ class NativePythonService:
         source = str(source or "")
         if not source.strip():
             raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
-        precheck_syntax(source)
+        _validate_source(source)
         session = await self._get(session_id)
         try:
             cell_id = session.runner.start_cell(source)
@@ -121,6 +133,104 @@ class NativePythonService:
         except TimeoutError:
             pass
         return _cell_snapshot(session, cell_id)
+
+    async def execute(
+        self,
+        execution_id: str,
+        source: str,
+        *,
+        session_id: str | None = None,
+        wait_seconds: float = 5,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Submit once, then observe that submission even if the caller disconnects."""
+        started = time.monotonic()
+        execution_id = str(UUID(execution_id))
+        if not source.strip():
+            raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
+        _validate_source(source)
+        fingerprint = hashlib.sha256(
+            json.dumps([session_id, source], ensure_ascii=False).encode()
+        ).hexdigest()
+        async with self._execution_lock:
+            previous = self._executions.get(execution_id)
+            if previous is not None:
+                if previous[0] != fingerprint:
+                    raise PythonSessionError(
+                        "EXECUTION_ID_CONFLICT", "Execution ID already identifies different code."
+                    )
+            else:
+                # Validate explicit sessions before recording acceptance. A durable reservation
+                # precedes every worker dispatch; a crash in between becomes unknown, not replay.
+                session = await self._get(session_id) if session_id else None
+                if session is not None and session.runner.is_running:
+                    raise PythonSessionError("SESSION_BUSY", "Python session is running a cell.")
+                receipt = {
+                    "execution_id": execution_id,
+                    "state": "accepted",
+                    "cell": None,
+                    "meta": meta or {},
+                }
+                if self._executions.reserve(execution_id, fingerprint, receipt):
+                    try:
+                        if session is None:
+                            created = await self.create_session()
+                            session = await self._get(created["session_id"])
+                        cell = await self.submit_cell(session.session_id, source, wait_seconds=0)
+                        cell_id = int(cell["cell_id"])
+                        self._running[execution_id] = (session, cell_id)
+                        receipt.update(state="running", cell=cell)
+                        self._executions.update(execution_id, receipt)
+                        self._completion_tasks[execution_id] = asyncio.create_task(
+                            self._complete_execution(
+                                execution_id, session, cell_id, not session_id, started
+                            )
+                        )
+                    except BaseException:
+                        receipt["state"] = "unknown"
+                        receipt["cell"] = None
+                        self._executions.update(execution_id, receipt)
+                        raise
+        task = self._completion_tasks.get(execution_id)
+        if task is not None and wait_seconds > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+            except TimeoutError:
+                pass
+        return await self.execution(execution_id)
+
+    async def execution(self, execution_id: str) -> dict[str, Any]:
+        previous = self._executions.get(execution_id)
+        if previous is None:
+            raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
+        receipt = previous[1]
+        active = self._running.get(execution_id)
+        if active is not None:
+            receipt["cell"] = _cell_snapshot(*active)
+        return receipt
+
+    async def _complete_execution(
+        self, execution_id: str, session: _Session, cell_id: int, ephemeral: bool, started: float
+    ) -> None:
+        previous = self._executions.get(execution_id)
+        assert previous is not None
+        receipt = previous[1]
+        try:
+            await session.runner.wait_cell(cell_id)
+            cell = _cell_snapshot(session, cell_id)
+            receipt.update(state="failed" if cell["exception"] else "succeeded", cell=cell)
+        except (ValueError, OSError, asyncio.CancelledError):
+            receipt["state"] = "unknown"
+            receipt["cell"] = None
+        finally:
+            receipt["meta"]["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
+            self._executions.update(execution_id, receipt)
+            self._running.pop(execution_id, None)
+            if ephemeral:
+                async with self._lock:
+                    self._sessions.pop(session.session_id, None)
+                await session.runner.aclose()
+            self._completion_tasks.pop(execution_id, None)
 
     async def snapshot(
         self,
@@ -168,6 +278,13 @@ def _session_id(value: str) -> str:
     if not normalized:
         raise PythonSessionError("INVALID_SESSION_ID", "session_id is required.")
     return normalized
+
+
+def _validate_source(source: str) -> None:
+    try:
+        precheck_syntax(source)
+    except (SyntaxError, ValueError) as exc:
+        raise PythonSessionError("INVALID_SOURCE", str(exc)) from exc
 
 
 def _optional_text(value: str | None) -> str | None:

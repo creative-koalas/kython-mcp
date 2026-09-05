@@ -106,6 +106,14 @@ class AsyncInterpreterRunner:
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._handle_msg(msg)
             )
+        if not self._stop:
+            self._loop.call_soon_threadsafe(self._worker_exited)
+
+    def _worker_exited(self) -> None:
+        # EOF without cell_end supplies no evidence of the execution outcome.
+        # Wake waiters so the receipt owner can report unknown instead of waiting forever.
+        self._running = False
+        self._cell_done.set()
 
     def _stderr_reader_loop(self) -> None:
         while True:
@@ -130,6 +138,8 @@ class AsyncInterpreterRunner:
 
     def _request_reader_stop(self) -> None:
         self._stop = True
+        if self._proc.poll() is not None:
+            return
         try:
             self._send_control({"type": "close"})
         except Exception:
@@ -382,6 +392,12 @@ class AsyncInterpreterRunner:
                     self._proc.kill()
                 except Exception:
                     pass
+            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
     def close(self):
         self._request_reader_stop()
