@@ -114,10 +114,15 @@ async def test_one_shot_owner_is_released_when_submission_or_persistence_fails(
             update(execution_id, receipt)
 
         monkeypatch.setattr(service._executions, "update", fail_update)
+    execution_id = str(uuid4())
+    source = "print('one shot')"
     with pytest.raises(OSError):
-        await service.execute(str(uuid4()), "print('one shot')", wait_seconds=2)
+        await service.execute(execution_id, source, wait_seconds=2)
     assert not service._sessions and not service._running and not service._completion_tasks
     assert len(runners) == 1 and runners[0]._proc.poll() is not None
+    assert (await service.execution(execution_id))["state"] == "unknown"
+    assert (await service.execute(execution_id, source))["state"] == "unknown"
+    assert len(runners) == 1
     await service.close()
 
 
@@ -163,6 +168,46 @@ async def test_interrupt_by_execution_id_reports_request_then_observed_result() 
     assert again["interrupt_sent"] is False and again["state"] == "failed"
     assert not service._sessions
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_completed_execution_does_not_cancel_new_cell_in_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = NativePythonService()
+    old_id, new_id = str(uuid4()), str(uuid4())
+    release_old_watcher = asyncio.Event()
+    complete = service._complete_execution
+
+    async def delayed_complete(execution_id, *args):
+        if execution_id == old_id:
+            await release_old_watcher.wait()
+        await complete(execution_id, *args)
+
+    monkeypatch.setattr(service, "_complete_execution", delayed_complete)
+    try:
+        session_id = (await service.create_session())["session_id"]
+        await service.execute(old_id, "print('old')", session_id=session_id, wait_seconds=0)
+        owner, cell_id = service._running[old_id]
+        await owner.runner.wait_cell(cell_id, timeout=2)
+        await service.execute(
+            new_id, "import time\nprint('new', flush=True)\ntime.sleep(.2)",
+            session_id=session_id, wait_seconds=0,
+        )
+        for _ in range(100):
+            if (await service.execution(new_id))["cell"]["stdout"] == "new\n":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("new cell did not start")
+        assert old_id in service._running
+        assert (await service.interrupt_execution(old_id))["interrupt_sent"] is False
+        assert (await service.execution(new_id, wait_seconds=2))["state"] == "succeeded"
+        release_old_watcher.set()
+        assert (await service.execution(old_id, wait_seconds=2))["state"] == "succeeded"
+    finally:
+        release_old_watcher.set()
+        await service.close()
 
 
 @pytest.mark.asyncio
