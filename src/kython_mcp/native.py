@@ -166,7 +166,7 @@ class NativePythonService:
         source: str,
         *,
         session_id: str | None = None,
-        wait_seconds: float = 5,
+        wait_seconds: float = 330,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Submit once, then observe that submission even if the caller disconnects."""
@@ -301,7 +301,7 @@ class NativePythonService:
         session_id: str,
         *,
         include_all: bool,
-        wait_seconds: float = 0,
+        wait_seconds: float = 330,
     ) -> dict[str, Any]:
         _validate_wait(wait_seconds)
         session = await self._get(session_id)
@@ -373,8 +373,8 @@ def _execution_fingerprint(session_id: str | None, source: str) -> str:
 
 
 def _validate_wait(wait_seconds: float) -> None:
-    if not 0 <= wait_seconds <= 30:
-        raise PythonSessionError("INVALID_WAIT", "wait_seconds must be between 0 and 30.")
+    if not 0 <= wait_seconds <= 330:
+        raise PythonSessionError("INVALID_WAIT", "wait_seconds must be between 0 and 330.")
 
 
 def _execution_cell(session: _Session, cell: dict[str, Any]) -> dict[str, Any]:

@@ -13,8 +13,10 @@ The trusted invocation ID identifies one execution. With a persistent
 submissions with the same source and session return the original receipt; a
 different source or session under that ID is rejected. Cancelling an HTTP wait
 does not cancel the execution. `execution(invocation_id)` reads its receipt.
-Pass `wait_seconds` (0 through 30) to wait for the existing execution; a cancelled
-wait never interrupts the worker. `interrupt_execution(invocation_id)` requests
+Submission and session snapshots wait up to 330 seconds by default; set
+`wait_seconds` from 0 through 330 for an earlier return. Receipt reads through
+`execution(invocation_id)` stay immediate unless an explicit wait is supplied.
+A cancelled wait never interrupts the worker. `interrupt_execution(invocation_id)` requests
 an interrupt and returns `interrupt_sent` plus the observed receipt state. A sent
 interrupt is not evidence of termination; read the receipt for the final result.
 

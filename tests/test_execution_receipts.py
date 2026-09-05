@@ -24,6 +24,42 @@ async def test_stateless_calls_discard_interpreter_but_keep_receipt(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_default_submission_and_explicit_session_snapshot_wait_for_completion() -> None:
+    service = NativePythonService()
+    try:
+        result = await asyncio.wait_for(service.execute(
+            str(uuid4()), "import time\ntime.sleep(.1)\nprint('default wait')"
+        ), timeout=3)
+        assert result["state"] == "succeeded" and result["cell"]["stdout"] == "default wait\n"
+        session_id = (await service.create_session())["session_id"]
+        await service.execute(
+            str(uuid4()), "import time\ntime.sleep(.1)\nprint('snapshot wait')",
+            session_id=session_id, wait_seconds=0,
+        )
+        result = await asyncio.wait_for(service.snapshot(session_id, include_all=False), timeout=3)
+        assert result["cells"][0]["done"] is True
+        assert result["cells"][0]["stdout"] == "snapshot wait\n"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_budget_accepts_330_and_rejects_outside_before_submission() -> None:
+    service = NativePythonService()
+    try:
+        result = await service.execute(str(uuid4()), "pass", wait_seconds=330)
+        assert result["state"] == "succeeded"
+        for value in (-1, 331, float("inf"), float("nan")):
+            execution_id = str(uuid4())
+            with pytest.raises(PythonSessionError, match="between 0 and 330"):
+                await service.execute(execution_id, "pass", wait_seconds=value)
+            with pytest.raises(PythonSessionError, match="not found"):
+                await service.execution(execution_id)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_wait_and_concurrent_retries_dispatch_once(tmp_path: Path) -> None:
     service = NativePythonService(receipt_path=tmp_path / "receipts.db")
     execution_id = str(uuid4())
