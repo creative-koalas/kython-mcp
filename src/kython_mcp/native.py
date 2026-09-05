@@ -246,6 +246,10 @@ class NativePythonService:
             except ValueError:
                 # The worker exited without a final cell result, before its watcher resumed.
                 receipt.update(state="unknown", cell=None)
+        elif receipt["state"] == "running":
+            # The owner finished but its terminal receipt could not be persisted.
+            # There is no live execution to wait for and the durable result is unknown.
+            receipt.update(state="unknown", cell=None)
         cell = receipt["cell"]
         if (
             cell is not None and cell["session_id"] is not None
@@ -329,7 +333,13 @@ class NativePythonService:
     async def interrupt_execution(self, execution_id: str) -> dict[str, Any]:
         receipt = await self.execution(execution_id)
         active = self._running.get(execution_id)
-        sent = active is not None and active[0].runner.cancel_current_cell()
+        cell = receipt["cell"]
+        # A completed cell's watcher may still be pending while this explicit session
+        # starts another cell. Only interrupt the observed target, with no intervening await.
+        sent = (
+            active is not None and cell is not None and cell["running"] and not cell["done"]
+            and active[0].runner.cancel_current_cell()
+        )
         return {
             "execution_id": execution_id,
             "session_id": None,
