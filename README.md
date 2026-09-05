@@ -13,6 +13,17 @@ The trusted invocation ID identifies one execution. With a persistent
 submissions with the same source and session return the original receipt; a
 different source or session under that ID is rejected. Cancelling an HTTP wait
 does not cancel the execution. `execution(invocation_id)` reads its receipt.
+Pass `wait_seconds` (0 through 30) to wait for the existing execution; a cancelled
+wait never interrupts the worker. `interrupt_execution(invocation_id)` requests
+an interrupt and returns `interrupt_sent` plus the observed receipt state. A sent
+interrupt is not evidence of termination; read the receipt for the final result.
+
+One-shot cell receipts have null `session_id` and `cell_id`: their only public
+handle is `execution_id`. Explicit sessions retain their session and cell IDs.
+Session listings contain only explicitly created sessions. Older receipts are
+normalized only when their stored source/session fingerprint proves one-shot
+ownership. A temporary interpreter is closed even if submission or receipt
+persistence fails before its completion watcher takes ownership.
 
 Receipts report `accepted`, `running`, `succeeded`, `failed`, or `unknown`.
 Completed receipts survive service restarts. Incomplete records become `unknown`

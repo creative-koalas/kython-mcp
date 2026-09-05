@@ -39,7 +39,7 @@ async def test_cancelled_wait_and_concurrent_retries_dispatch_once(tmp_path: Pat
         service.execute(execution_id, source, wait_seconds=2) for _ in range(5)
     ))
     assert all(result["state"] == "succeeded" for result in results)
-    assert len({result["cell"]["cell_id"] for result in results}) == 1
+    assert all(result["cell"]["session_id"] is None and result["cell"]["cell_id"] is None for result in results)
     assert effect.read_text() == "once\n"
     with pytest.raises(PythonSessionError, match="different code"):
         await service.execute(execution_id, "print('another effect')")
@@ -58,6 +58,8 @@ async def test_restart_keeps_completed_receipt_and_never_replays_uncertain_work(
     restarted = NativePythonService(receipt_path=db)
     assert (await restarted.execution(completed_id))["state"] == "succeeded"
     assert (await restarted.execute(running_id, source))["state"] == "unknown"
+    unknown_interrupt = await restarted.interrupt_execution(running_id)
+    assert unknown_interrupt["state"] == "unknown" and unknown_interrupt["interrupt_sent"] is False
     assert await restarted.list_sessions() == []
     await restarted.close()
 
@@ -71,11 +73,116 @@ async def test_explicit_sessions_preserve_variables_without_reusing_ids_after_re
         str(uuid4()), "print(value + 1)", session_id=session_id, wait_seconds=2
     )
     assert second["cell"]["stdout"] == "42\n"
+    assert second["cell"]["session_id"] == session_id
+    assert second["cell"]["cell_id"] == 2
     assert len(await service.list_sessions()) == 1
     await service.close()
     restarted = NativePythonService()
     assert (await restarted.create_session())["session_id"] != session_id
     await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["submit", "running_receipt", "terminal_receipt"])
+async def test_one_shot_owner_is_released_when_submission_or_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    runners = []
+    create = service._create_session
+
+    async def capture_owner(**kwargs):
+        session = await create(**kwargs)
+        runners.append(session.runner)
+        return session
+
+    monkeypatch.setattr(service, "_create_session", capture_owner)
+    if failure == "submit":
+        async def fail_submit(*args, **kwargs):
+            raise OSError("submission unavailable")
+        monkeypatch.setattr(service, "submit_cell", fail_submit)
+    else:
+        update = service._executions.update
+        failed = False
+
+        def fail_update(execution_id, receipt):
+            nonlocal failed
+            target = "running" if failure == "running_receipt" else "succeeded"
+            if not failed and receipt["state"] == target:
+                failed = True
+                raise OSError("receipt persistence unavailable")
+            update(execution_id, receipt)
+
+        monkeypatch.setattr(service._executions, "update", fail_update)
+    with pytest.raises(OSError):
+        await service.execute(str(uuid4()), "print('one shot')", wait_seconds=2)
+    assert not service._sessions and not service._running and not service._completion_tasks
+    assert len(runners) == 1 and runners[0]._proc.poll() is not None
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_receipt_wait_and_cancel_do_not_replay_or_interrupt(tmp_path: Path) -> None:
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    execution_id = str(uuid4())
+    effect = tmp_path / "once.txt"
+    source = f"import time\ntime.sleep(.3)\nopen({str(effect)!r}, 'a').write('once\\n')"
+    await service.execute(execution_id, source, wait_seconds=0)
+    assert await service.list_sessions() == []
+    waiting = asyncio.create_task(service.execution(execution_id, wait_seconds=2))
+    await asyncio.sleep(0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    pending = await service.execution(execution_id, wait_seconds=.01)
+    assert pending["state"] == "running"
+    assert pending["cell"]["session_id"] is None and pending["cell"]["cell_id"] is None
+    complete = await service.execution(execution_id, wait_seconds=2)
+    assert complete["state"] == "succeeded" and effect.read_text() == "once\n"
+    assert not service._sessions
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_by_execution_id_reports_request_then_observed_result() -> None:
+    service = NativePythonService()
+    execution_id = str(uuid4())
+    await service.execute(execution_id, "import time\nprint('started', flush=True)\ntime.sleep(30)", wait_seconds=0)
+    for _ in range(100):
+        if (await service.execution(execution_id))["cell"]["stdout"] == "started\n":
+            break
+        await asyncio.sleep(.02)
+    else:
+        pytest.fail("worker did not start")
+    requested = await service.interrupt_execution(execution_id)
+    assert requested == {"execution_id": execution_id, "session_id": None, "state": "running", "interrupt_sent": True}
+    finished = await service.execution(execution_id, wait_seconds=2)
+    assert finished["state"] == "failed"
+    assert "KeyboardInterrupt" in finished["cell"]["exception"]
+    again = await service.interrupt_execution(execution_id)
+    assert again["interrupt_sent"] is False and again["state"] == "failed"
+    assert not service._sessions
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_older_receipt_owner_is_normalized_from_stored_fingerprint(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    for explicit_session in (None, "explicit-session"):
+        execution_id = str(uuid4())
+        source = "print('completed')"
+        fingerprint = hashlib.sha256(json.dumps([explicit_session, source], ensure_ascii=False).encode()).hexdigest()
+        service._executions.reserve(execution_id, fingerprint, {
+            "execution_id": execution_id, "state": "succeeded", "meta": {},
+            "cell": {"source": source, "session_id": explicit_session or "old-internal-owner", "cell_id": 1},
+        })
+        receipt = await service.execution(execution_id)
+        assert receipt["cell"]["session_id"] == explicit_session
+        assert receipt["cell"]["cell_id"] == (1 if explicit_session else None)
+    await service.close()
 
 
 @pytest.mark.asyncio

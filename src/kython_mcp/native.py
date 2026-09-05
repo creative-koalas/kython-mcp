@@ -27,6 +27,7 @@ class _Session:
     runner: AsyncInterpreterRunner
     label: str | None = None
     description: str | None = None
+    ephemeral: bool = False
     created_at: float = field(default_factory=time.time)
 
 
@@ -61,6 +62,11 @@ class NativePythonService:
         label: str | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
+        return _session_payload(await self._create_session(label=label, description=description))
+
+    async def _create_session(
+        self, *, label: str | None = None, description: str | None = None, ephemeral: bool = False
+    ) -> _Session:
         async with self._lock:
             session_id = uuid4().hex
             runner = AsyncInterpreterRunner(
@@ -72,14 +78,15 @@ class NativePythonService:
                 runner=runner,
                 label=_optional_text(label),
                 description=_optional_text(description),
+                ephemeral=ephemeral,
             )
             self._sessions[session_id] = session
-        return _session_payload(session)
+        return session
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         async with self._lock:
             sessions = sorted(self._sessions.values(), key=lambda item: item.created_at)
-            return [_session_payload(session) for session in sessions]
+            return [_session_payload(session) for session in sessions if not session.ephemeral]
 
     async def update_session(
         self,
@@ -162,14 +169,13 @@ class NativePythonService:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Submit once, then observe that submission even if the caller disconnects."""
+        _validate_wait(wait_seconds)
         started = time.monotonic()
         execution_id = str(UUID(execution_id))
         if not source.strip():
             raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
         _validate_source(source)
-        fingerprint = hashlib.sha256(
-            json.dumps([session_id, source], ensure_ascii=False).encode()
-        ).hexdigest()
+        fingerprint = _execution_fingerprint(session_id, source)
         async with self._execution_lock:
             previous = self._executions.get(execution_id)
             if previous is not None:
@@ -190,34 +196,45 @@ class NativePythonService:
                     "meta": meta or {},
                 }
                 if self._executions.reserve(execution_id, fingerprint, receipt):
+                    owned_session = None
+                    watcher_started = False
                     try:
                         if session is None:
-                            created = await self.create_session()
-                            session = await self._get(created["session_id"])
+                            owned_session = await self._create_session(ephemeral=True)
+                            session = owned_session
                         cell = await self.submit_cell(session.session_id, source, wait_seconds=0)
                         cell_id = int(cell["cell_id"])
                         self._running[execution_id] = (session, cell_id)
-                        receipt.update(state="running", cell=cell)
+                        receipt.update(state="running", cell=_execution_cell(session, cell))
                         self._executions.update(execution_id, receipt)
                         self._completion_tasks[execution_id] = asyncio.create_task(
                             self._complete_execution(
-                                execution_id, session, cell_id, not session_id, started
+                                execution_id, session, cell_id, receipt, started
                             )
                         )
+                        watcher_started = True
                     except BaseException:
                         receipt["state"] = "unknown"
                         receipt["cell"] = None
                         self._executions.update(execution_id, receipt)
                         raise
+                    finally:
+                        if not watcher_started:
+                            self._running.pop(execution_id, None)
+                            if owned_session is not None:
+                                await self._release_session(owned_session)
+        return await self.execution(execution_id, wait_seconds=wait_seconds)
+
+    async def execution(
+        self, execution_id: str, *, wait_seconds: float = 0
+    ) -> dict[str, Any]:
+        _validate_wait(wait_seconds)
         task = self._completion_tasks.get(execution_id)
         if task is not None and wait_seconds > 0:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
             except TimeoutError:
                 pass
-        return await self.execution(execution_id)
-
-    async def execution(self, execution_id: str) -> dict[str, Any]:
         previous = self._executions.get(execution_id)
         if previous is None:
             raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
@@ -225,42 +242,65 @@ class NativePythonService:
         active = self._running.get(execution_id)
         if active is not None:
             try:
-                receipt["cell"] = _cell_snapshot(*active)
+                receipt["cell"] = _execution_cell(active[0], _cell_snapshot(*active))
             except ValueError:
                 # The worker exited without a final cell result, before its watcher resumed.
                 receipt.update(state="unknown", cell=None)
+        cell = receipt["cell"]
+        if (
+            cell is not None and cell["session_id"] is not None
+            and previous[0] == _execution_fingerprint(None, cell["source"])
+        ):
+            # Older receipts persist the submitted owner choice in their fingerprint.
+            # Normalize only a proven one-shot submission, never guess from cell IDs.
+            cell.update(session_id=None, cell_id=None)
         return receipt
 
     async def _complete_execution(
-        self, execution_id: str, session: _Session, cell_id: int, ephemeral: bool, started: float
+        self, execution_id: str, session: _Session, cell_id: int,
+        receipt: dict[str, Any], started: float
     ) -> None:
-        previous = self._executions.get(execution_id)
-        assert previous is not None
-        receipt = previous[1]
         try:
             await session.runner.wait_cell(cell_id)
             cell = _cell_snapshot(session, cell_id)
-            receipt.update(state="failed" if cell["exception"] else "succeeded", cell=cell)
+            receipt.update(
+                state="failed" if cell["exception"] else "succeeded",
+                cell=_execution_cell(session, cell),
+            )
         except (ValueError, OSError, asyncio.CancelledError):
             receipt["state"] = "unknown"
             receipt["cell"] = None
         finally:
             receipt["meta"]["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
-            self._executions.update(execution_id, receipt)
-            self._running.pop(execution_id, None)
-            if ephemeral:
-                async with self._lock:
-                    self._sessions.pop(session.session_id, None)
-                await session.runner.aclose()
-            self._completion_tasks.pop(execution_id, None)
+            try:
+                self._executions.update(execution_id, receipt)
+            finally:
+                self._running.pop(execution_id, None)
+                try:
+                    if session.ephemeral:
+                        await self._release_session(session)
+                finally:
+                    self._completion_tasks.pop(execution_id, None)
+
+    async def _release_session(self, session: _Session) -> None:
+        async with self._lock:
+            self._sessions.pop(session.session_id, None)
+        await session.runner.aclose()
 
     async def snapshot(
         self,
         session_id: str,
         *,
         include_all: bool,
+        wait_seconds: float = 0,
     ) -> dict[str, Any]:
+        _validate_wait(wait_seconds)
         session = await self._get(session_id)
+        execution_id = next(
+            (key for key, (owner, _) in self._running.items() if owner is session), None
+        )
+        if execution_id is not None:
+            await self.execution(execution_id, wait_seconds=wait_seconds)
         cells = session.runner.list_cells()
         if not cells:
             return {"session": _session_payload(session), "cells": []}
@@ -286,6 +326,17 @@ class NativePythonService:
             raise PythonSessionError("NO_RUNNING_CELL", "No Python cell is running.")
         return {"session_id": session.session_id, "interrupt_sent": True}
 
+    async def interrupt_execution(self, execution_id: str) -> dict[str, Any]:
+        receipt = await self.execution(execution_id)
+        active = self._running.get(execution_id)
+        sent = active is not None and active[0].runner.cancel_current_cell()
+        return {
+            "execution_id": execution_id,
+            "session_id": None,
+            "state": receipt["state"],
+            "interrupt_sent": sent,
+        }
+
     async def _get(self, session_id: str) -> _Session:
         normalized = _session_id(session_id)
         async with self._lock:
@@ -300,6 +351,21 @@ def _session_id(value: str) -> str:
     if not normalized:
         raise PythonSessionError("INVALID_SESSION_ID", "session_id is required.")
     return normalized
+
+
+def _execution_fingerprint(session_id: str | None, source: str) -> str:
+    return hashlib.sha256(json.dumps([session_id, source], ensure_ascii=False).encode()).hexdigest()
+
+
+def _validate_wait(wait_seconds: float) -> None:
+    if not 0 <= wait_seconds <= 30:
+        raise PythonSessionError("INVALID_WAIT", "wait_seconds must be between 0 and 30.")
+
+
+def _execution_cell(session: _Session, cell: dict[str, Any]) -> dict[str, Any]:
+    if session.ephemeral:
+        cell.update(session_id=None, cell_id=None)
+    return cell
 
 
 def _validate_source(source: str) -> None:
