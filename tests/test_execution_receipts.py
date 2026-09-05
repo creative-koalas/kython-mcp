@@ -96,3 +96,17 @@ async def test_invalid_source_never_reserves_execution() -> None:
     with pytest.raises(PythonSessionError, match="not found"):
         await service.execution(execution_id)
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_deleting_running_explicit_session_finishes_receipt_as_unknown() -> None:
+    service = NativePythonService()
+    session_id = (await service.create_session())["session_id"]
+    execution_id = str(uuid4())
+    source = "import time\ntime.sleep(30)"
+    await service.execute(execution_id, source, session_id=session_id, wait_seconds=0)
+    await service.delete_session(session_id)
+    receipt = await service.execute(execution_id, source, session_id=session_id)
+    assert receipt["state"] == "unknown"
+    assert receipt["cell"] is None
+    await service.close()

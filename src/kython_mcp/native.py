@@ -103,6 +103,24 @@ class NativePythonService:
             session = self._sessions.pop(normalized, None)
         if session is None:
             raise PythonSessionError("SESSION_NOT_FOUND", "Python session was not found.")
+        execution_ids = [
+            execution_id
+            for execution_id, (owner, _) in self._running.items()
+            if owner is session
+        ]
+        tasks = [self._completion_tasks[execution_id] for execution_id in execution_ids]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for execution_id in execution_ids:
+            self._completion_tasks.pop(execution_id, None)
+            self._running.pop(execution_id, None)
+            previous = self._executions.get(execution_id)
+            if previous is not None and previous[1]["state"] in {"accepted", "running"}:
+                # Cancellation may happen before the watcher coroutine starts at all.
+                receipt = previous[1]
+                receipt.update(state="unknown", cell=None)
+                self._executions.update(execution_id, receipt)
         await session.runner.aclose()
         return {"session_id": normalized}
 
@@ -206,7 +224,11 @@ class NativePythonService:
         receipt = previous[1]
         active = self._running.get(execution_id)
         if active is not None:
-            receipt["cell"] = _cell_snapshot(*active)
+            try:
+                receipt["cell"] = _cell_snapshot(*active)
+            except ValueError:
+                # The worker exited without a final cell result, before its watcher resumed.
+                receipt.update(state="unknown", cell=None)
         return receipt
 
     async def _complete_execution(
