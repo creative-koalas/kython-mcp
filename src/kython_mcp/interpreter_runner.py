@@ -5,12 +5,18 @@ Each session spawns its own Python process, enabling custom Python executables.
 
 import asyncio
 import json
+import os
+import select
 import subprocess
 import threading
-import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import IO, Dict, List, Optional
+
+# A reader checks `_stop` after every poll, so this is also the bound on how long
+# stop-then-join can take.
+_READER_POLL_SECONDS = 0.2
 
 
 class BusyError(RuntimeError):
@@ -88,13 +94,61 @@ class AsyncInterpreterRunner:
         self._stderr_thread.start()
 
     # ---------- Reader loops ----------
+    def _iter_lines(self, stream: IO[str] | None) -> Iterator[str]:
+        """Yield lines from a reader pipe without ever waiting on an EOF that may not come.
+
+        Two rules this exists for:
+
+        * A cell can leave a detached process holding the pipe's write end, so the pipe
+          may never reach EOF. ``select`` bounds every wait, which is what makes
+          ``_request_reader_stop()`` effective instead of a flag nobody observes.
+        * A concurrent ``close()`` on a buffered wrapper waits for the reader sitting in
+          it, so readers must not park inside ``readline()``. Raw ``os.read`` keeps the
+          buffered wrapper out of the read path entirely.
+
+        Line framing matches ``readline()``: complete lines keep their terminator, and a
+        trailing partial line is yielded as-is — both at EOF (the worker died mid-line)
+        and when ``_stop`` arrives, so nothing the worker already wrote is dropped.
+
+        Requires a POSIX ``select`` on the pipe fds: workspace agents run in Linux
+        containers, and macOS is fine for development; Windows pipes are not supported.
+        """
+        if stream is None:
+            return
+        try:
+            fd = stream.fileno()
+        except (OSError, ValueError):
+            return
+        buffer = b""
+        while not self._stop:
+            try:
+                ready, _, _ = select.select([fd], [], [], _READER_POLL_SECONDS)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                yield raw.decode("utf-8", errors="replace") + "\n"
+        if buffer:
+            yield buffer.decode("utf-8", errors="replace")
+
+    def _publish(self, msg: dict) -> None:
+        """Hand one worker message to the loop, tagged with its session."""
+        msg["session"] = self.name
+        self._loop.call_soon_threadsafe(asyncio.create_task, self._handle_msg(msg))
+
     def _stdout_reader_loop(self) -> None:
-        while True:
-            if self._stop:
-                break
-            line = self._proc.stdout.readline() if self._proc.stdout else ""
-            if not line:
-                break
+        for line in self._iter_lines(self._proc.stdout):
             line = line.strip()
             if not line:
                 continue
@@ -102,10 +156,7 @@ class AsyncInterpreterRunner:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 msg = {"type": "process_stdout", "chunk": line}
-            msg["session"] = self.name
-            self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._handle_msg(msg)
-            )
+            self._publish(msg)
         if not self._stop:
             self._loop.call_soon_threadsafe(self._worker_exited)
 
@@ -116,25 +167,21 @@ class AsyncInterpreterRunner:
         self._cell_done.set()
 
     def _stderr_reader_loop(self) -> None:
-        while True:
-            if self._stop:
-                break
-            line = self._proc.stderr.readline() if self._proc.stderr else ""
-            if not line:
-                break
+        for line in self._iter_lines(self._proc.stderr):
             self._stderr_lines.append(line)
-            msg = {"type": "process_stderr", "chunk": line, "session": self.name}
-            self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._handle_msg(msg)
-            )
+            self._publish({"type": "process_stderr", "chunk": line})
 
     def _send_control(self, payload: dict) -> None:
         if not self._proc or not self._proc.stdin:
             return
         line = json.dumps(payload, ensure_ascii=False)
-        with self._stdin_lock:
-            self._proc.stdin.write(line + "\n")
-            self._proc.stdin.flush()
+        try:
+            with self._stdin_lock:
+                self._proc.stdin.write(line + "\n")
+                self._proc.stdin.flush()
+        except ValueError as exc:
+            # A closed stream raises ValueError, not OSError; callers only know BrokenPipe.
+            raise BrokenPipeError(str(exc)) from exc
 
     def _request_reader_stop(self) -> None:
         self._stop = True
@@ -153,6 +200,12 @@ class AsyncInterpreterRunner:
 
 
     async def _handle_msg(self, msg: dict):
+        """Apply one worker message to the cell state, then broadcast it.
+
+        Messages arrive either as parsed worker JSON or as a raw ``process_stdout``
+        fallback for a line that was not JSON (teardown cut it in half, or something
+        outside the worker's stdout wrapper wrote to fd 1); neither is an error.
+        """
         msg_type = msg.get("type")
 
         if msg_type == "stdout":
@@ -368,52 +421,47 @@ class AsyncInterpreterRunner:
             self._event_subscribers.remove(queue)
 
     async def aclose(self):
-        self._request_reader_stop()
-        if self._stdout_thread.is_alive():
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._stdout_thread.join), timeout=1.0
-                )
-            except (asyncio.TimeoutError, RuntimeError):
-                pass
-        if self._stderr_thread.is_alive():
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._stderr_thread.join), timeout=1.0
-                )
-            except (asyncio.TimeoutError, RuntimeError):
-                pass
-        if self._proc:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=1)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+        """Teardown blocks by nature, so it runs off the loop.
+
+        The caller bounds the *wait*, not the work: ``asyncio.wait_for`` can stop waiting,
+        but the teardown thread finishes on its own — a pipe close or a process wait has
+        nothing cancellable in it.
+        """
+        await asyncio.to_thread(self.close)
 
     def close(self):
+        """Stop the readers, the worker, then its pipes — in that order.
+
+        The joins are deliberately unbounded: a reader only ever waits
+        ``_READER_POLL_SECONDS`` before re-checking ``_stop``, and closing a pipe while a
+        reader could still be inside it is how the workspace agent used to wedge.
+        """
         self._request_reader_stop()
-        if self._stdout_thread.is_alive():
-            self._stdout_thread.join(timeout=1.0)
-        if self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=1.0)
-        if self._proc:
+        self._stdout_thread.join()
+        self._stderr_thread.join()
+        self._terminate_process()
+        if self._proc is None:
+            return
+        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if stream is None:
+                continue
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=1)
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def _terminate_process(self) -> None:
+        """Stop the worker process; ``close()`` closes the pipes once this returns."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=1)
+        except Exception:
+            try:
+                self._proc.kill()
             except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+                pass
 
     def __enter__(self):
         return self
