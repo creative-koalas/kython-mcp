@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,13 @@ from uuid import UUID, uuid4
 from .executions import ExecutionStore
 from .interpreter_runner import AsyncInterpreterRunner, BusyError
 from .utils import precheck_syntax
+
+logger = logging.getLogger(__name__)
+
+# Teardown is bounded: a wedged interpreter must never take the event loop with it.
+# Keep this well above the runner's own worst case (one reader poll + the terminate
+# wait, ~1.2s) so it only ever fires for a genuinely wedged teardown.
+SESSION_TEARDOWN_TIMEOUT_SECONDS = 10.0
 
 
 class PythonSessionError(RuntimeError):
@@ -52,7 +60,7 @@ class NativePythonService:
             sessions = list(self._sessions.values())
             self._sessions.clear()
         await asyncio.gather(
-            *(session.runner.aclose() for session in sessions),
+            *(self._teardown_session(session) for session in sessions),
             return_exceptions=True,
         )
         self._executions.close()
@@ -129,7 +137,7 @@ class NativePythonService:
                 receipt = previous[1]
                 receipt.update(state="unknown", cell=None)
                 self._executions.update(execution_id, receipt)
-        await session.runner.aclose()
+        await self._teardown_session(session)
         return {"session_id": normalized}
 
     async def submit_cell(
@@ -294,7 +302,22 @@ class NativePythonService:
     async def _release_session(self, session: _Session) -> None:
         async with self._lock:
             self._sessions.pop(session.session_id, None)
-        await session.runner.aclose()
+        await self._teardown_session(session)
+
+    async def _teardown_session(self, session: _Session) -> None:
+        """Close one session's interpreter with a hard upper bound.
+
+        The runner already bounds its own cleanup; this is the backstop that keeps a
+        future regression from turning a single wedged teardown into a dead workspace.
+        """
+        try:
+            await asyncio.wait_for(
+                session.runner.aclose(), timeout=SESSION_TEARDOWN_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            logger.error(
+                "session=%s event=interpreter_teardown_timeout", session.session_id
+            )
 
     async def snapshot(
         self,
