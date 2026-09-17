@@ -1,5 +1,11 @@
 # kython-mcp
 
+> [!IMPORTANT]
+> **Psygo 架构归属与部署说明**
+> `kython-mcp` **不是**独立的 Kubernetes 服务，而是作为沙箱基础运行时组件**打包注入进 `vm-agent` 容器镜像**（`WORKSPACE_IMAGE`）中运行。
+> 如需修改并在测试或生产环境中生效，请在改动后按照 `vm-agent` 的构建发布流程更新镜像并重启控制面。
+> 详情参考：[`virtual-computer-service/vm-agent/docs/deployment.md`](../../../virtual-computer-service/vm-agent/docs/deployment.md)。
+
 Native, process-isolated Python execution for PsyGo workspaces. The historical
 package name remains; workspace capabilities call `NativePythonService` directly.
 
