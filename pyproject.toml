@@ -1,16 +1,11 @@
 [project]
 name = "kython-mcp"
 version = "0.1.0"
-description = "Python interpreter MCP server with process-based sessions"
+description = "Process-isolated Python session engine for PsyGo workspaces"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "mcp>=1.0.0",
-    "pyyaml>=6.0.3",
 ]
-
-[project.scripts]
-kython-mcp = "kython_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -21,20 +16,23 @@ packages = ["src/kython_mcp"]
 
 [tool.protected-artifacts]
 cython-targets = [
+    "src/kython_mcp/executions.py",
     "src/kython_mcp/interpreter_runner.py",
     "src/kython_mcp/local_log.py",
-    "src/kython_mcp/sessions.py",
+    "src/kython_mcp/native.py",
     "src/kython_mcp/utils.py",
 ]
+# worker.py is executed as a script by each session's own interpreter, which
+# may differ from the host Python, so it must stay a plaintext .py file.
 plaintext-runtime-py = [
     "src/kython_mcp/__init__.py",
-    "src/kython_mcp/__main__.py",
-    "src/kython_mcp/server.py",
-    "src/kython_mcp/tools.py",
     "src/kython_mcp/worker.py",
 ]
 
 [dependency-groups]
 dev = [
     "ipython>=9.7.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
 ]

@@ -1,21 +1,47 @@
 # kython-mcp
 
-Python interpreter MCP server with process-based sessions.
+> [!IMPORTANT]
+> **Psygo 架构归属与部署说明**
+> `kython-mcp` **不是**独立的 Kubernetes 服务，而是作为沙箱基础运行时组件**打包注入进 `vm-agent` 容器镜像**（`WORKSPACE_IMAGE`）中运行。
+> 如需修改并在测试或生产环境中生效，请在改动后按照 `vm-agent` 的构建发布流程更新镜像并重启控制面。
+> 详情参考：[`virtual-computer-service/vm-agent/docs/deployment.md`](../../../virtual-computer-service/vm-agent/docs/deployment.md)。
 
-## Development
+Native, process-isolated Python execution for PsyGo workspaces. The historical
+package name remains; workspace capabilities call `NativePythonService` directly.
+
+`execute(invocation_id, source)` runs self-contained code in a fresh interpreter
+and releases that interpreter when execution ends. Pass an explicitly created
+`session_id` only when multiple cells need shared variables. Process IDs are not
+part of this API. Session IDs are unique across service restarts.
+
+The trusted invocation ID identifies one execution. With a persistent
+`receipt_path`, SQLite commits its reservation before dispatching code. Repeated
+submissions with the same source and session return the original receipt; a
+different source or session under that ID is rejected. Cancelling an HTTP wait
+does not cancel the execution. `execution(invocation_id)` reads its receipt.
+Submission and session snapshots wait up to 330 seconds by default; set
+`wait_seconds` from 0 through 330 for an earlier return. Receipt reads through
+`execution(invocation_id)` stay immediate unless an explicit wait is supplied.
+A cancelled wait never interrupts the worker. `interrupt_execution(invocation_id)` requests
+an interrupt and returns `interrupt_sent` plus the observed receipt state. A sent
+interrupt is not evidence of termination; read the receipt for the final result.
+
+One-shot cell receipts have null `session_id` and `cell_id`: their only public
+handle is `execution_id`. Explicit sessions retain their session and cell IDs.
+Session listings contain only explicitly created sessions. Older receipts are
+normalized only when their stored source/session fingerprint proves one-shot
+ownership. A temporary interpreter is closed even if submission or receipt
+persistence fails before its completion watcher takes ownership.
+
+Receipts report `accepted`, `running`, `succeeded`, `failed`, or `unknown`.
+Completed receipts survive service restarts. Incomplete records become `unknown`
+after restart and are never replayed: neither a lost worker nor a lost response
+proves that code had no effects. The workspace must persist the receipt file with
+its task data; deleting that state removes the execution history.
+
+The lower-level `submit_cell` and session APIs manage explicitly owned interpreter
+sessions; network providers should use `execute` to bind trusted invocation IDs.
 
 ```bash
-npx @modelcontextprotocol/inspector uv run python -m src.kython_mcp
-```
-
-## Run (stdio)
-
-```bash
-python -m src.kython_mcp
-```
-
-## Run (streamable-http)
-
-```bash
-python -m src.kython_mcp --http
+uv run pytest -q
 ```
