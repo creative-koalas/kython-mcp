@@ -138,6 +138,9 @@ def _run_cell(cell_id: int, source: str) -> None:
         exc_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
     dt_ms = (time.perf_counter() - t0) * 1000.0
+    # The parent can submit again as soon as it receives cell_end. Publish
+    # readiness first; the main loop still executes queued cells serially.
+    cell_idle.set()
     _send(
         {
             "type": "cell_end",
@@ -146,7 +149,6 @@ def _run_cell(cell_id: int, source: str) -> None:
             "timing_ms": round(dt_ms, 3),
         }
     )
-    cell_idle.set()
 
 
 def _reader_loop() -> None:
