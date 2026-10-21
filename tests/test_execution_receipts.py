@@ -1,12 +1,75 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from kython_mcp import native
 from kython_mcp.native import NativePythonService, PythonSessionError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_source", "first_state"),
+    [("print('first')", "succeeded"), ("raise ValueError('first')", "failed")],
+)
+async def test_completed_receipt_accepts_immediate_next_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_source: str, first_state: str
+) -> None:
+    # Hold the worker inside its first completion publication until the reader
+    # accepts or rejects the next request. This makes the handoff window
+    # deterministic rather than relying on a scheduler delay or stress loop.
+    worker = Path(native.__file__).with_name("worker.py")
+    launcher = tmp_path / "handoff_worker.py"
+    launcher.write_text(
+        "import queue, threading\n"
+        f"path = {str(worker)!r}\n"
+        "namespace = {'__name__': 'handoff_test', '__file__': path}\n"
+        "with open(path) as source:\n"
+        "    exec(compile(source.read(), path, 'exec'), namespace)\n"
+        "release = threading.Event()\n"
+        "class CellQueue(queue.Queue):\n"
+        "    def put(self, item, *args, **kwargs):\n"
+        "        super().put(item, *args, **kwargs)\n"
+        "        if item is None or item.get('cell_id') == 2:\n"
+        "            release.set()\n"
+        "namespace['cell_queue'] = CellQueue()\n"
+        "original_send = namespace['_send']\n"
+        "def send(message):\n"
+        "    original_send(message)\n"
+        "    if message.get('type') == 'cell_rejected':\n"
+        "        release.set()\n"
+        "    elif message.get('type') == 'cell_end' and message.get('cell_id') == 1:\n"
+        "        if not release.wait(5):\n"
+        "            raise RuntimeError('next request did not reach the worker')\n"
+        "namespace['_send'] = send\n"
+        "namespace['main']()\n"
+    )
+    runner_factory = native.AsyncInterpreterRunner
+
+    def coordinated_runner(**kwargs):
+        return runner_factory(
+            worker_path=str(launcher), python_executable=sys.executable, **kwargs
+        )
+
+    monkeypatch.setattr(native, "AsyncInterpreterRunner", coordinated_runner)
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    try:
+        session_id = (await service.create_session())["session_id"]
+        first = await service.execute(
+            str(uuid4()), first_source, session_id=session_id, wait_seconds=1
+        )
+        assert first["state"] == first_state
+        second = await service.execute(
+            str(uuid4()), "print('second')", session_id=session_id, wait_seconds=1
+        )
+        assert second["state"] == "succeeded", second
+        assert second["cell"]["stdout"] == "second\n"
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio
