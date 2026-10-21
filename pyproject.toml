@@ -20,6 +20,7 @@ cython-targets = [
     "src/kython_mcp/interpreter_runner.py",
     "src/kython_mcp/local_log.py",
     "src/kython_mcp/native.py",
+    "src/kython_mcp/redaction.py",
     "src/kython_mcp/utils.py",
 ]
 # worker.py is executed as a script by each session's own interpreter, which

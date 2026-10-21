@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,21 @@ class PythonSessionError(RuntimeError):
 
 
 @dataclass
+class _ExecutionCleanup:
+    callback: Callable[[], None] | None
+    transferred: bool = False
+
+    def run(self) -> None:
+        callback, self.callback = self.callback, None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - Cleanup must not leak callback exception payloads.
+                # A cleanup callback may hold credentials; never stringify its exception.
+                logger.error("event=execution_binding_cleanup_failed")
+
+
+@dataclass
 class _Session:
     session_id: str
     runner: AsyncInterpreterRunner
@@ -50,6 +66,7 @@ class NativePythonService:
         self._submitting: set[str] = set()
         self._running: dict[str, tuple[_Session, int]] = {}
         self._completion_tasks: dict[str, asyncio.Task[None]] = {}
+        self._execution_cleanups: dict[str, _ExecutionCleanup] = {}
 
     async def close(self) -> None:
         tasks = list(self._completion_tasks.values())
@@ -63,6 +80,9 @@ class NativePythonService:
             *(self._teardown_session(session) for session in sessions),
             return_exceptions=True,
         )
+        for cleanup in tuple(self._execution_cleanups.values()):
+            cleanup.run()
+        self._execution_cleanups.clear()
         self._executions.close()
 
     async def create_session(
@@ -74,13 +94,19 @@ class NativePythonService:
         return _session_payload(await self._create_session(label=label, description=description))
 
     async def _create_session(
-        self, *, label: str | None = None, description: str | None = None, ephemeral: bool = False
+        self, *, label: str | None = None, description: str | None = None, ephemeral: bool = False,
+        execution_env: dict[str, str] | None = None,
+        output_secrets: tuple[str, ...] = (),
+        isolated_process_group: bool = False,
     ) -> _Session:
         async with self._lock:
             session_id = uuid4().hex
             runner = AsyncInterpreterRunner(
                 name=f"session-{session_id}",
                 loop=asyncio.get_running_loop(),
+                execution_env=execution_env,
+                output_secrets=output_secrets,
+                isolated_process_group=isolated_process_group,
             )
             session = _Session(
                 session_id=session_id,
@@ -176,15 +202,47 @@ class NativePythonService:
         session_id: str | None = None,
         wait_seconds: float = 330,
         meta: dict[str, Any] | None = None,
+        execution_env: dict[str, str] | None = None,
+        output_secrets: tuple[str, ...] = (),
+        binding_fingerprint: str | None = None,
+        on_execution_finished: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Submit once, then observe that submission even if the caller disconnects."""
+        cleanup = _ExecutionCleanup(on_execution_finished)
+        has_binding = (
+            execution_env is not None or bool(output_secrets)
+            or binding_fingerprint is not None or on_execution_finished is not None
+        )
+        try:
+            if has_binding and session_id is not None:
+                raise PythonSessionError(
+                    "CREDENTIAL_SESSION_UNSUPPORTED",
+                    "Credential-bound Python execution requires a one-shot interpreter.",
+                )
+            return await self._execute(
+                execution_id, source, session_id=session_id, wait_seconds=wait_seconds,
+                meta=meta, execution_env=execution_env, output_secrets=output_secrets,
+                binding_fingerprint=binding_fingerprint, has_binding=has_binding,
+                cleanup=cleanup,
+            )
+        finally:
+            # Duplicate invocations and pre-dispatch errors own no running execution.
+            if not cleanup.transferred:
+                cleanup.run()
+
+    async def _execute(
+        self, execution_id: str, source: str, *, session_id: str | None,
+        wait_seconds: float, meta: dict[str, Any] | None,
+        execution_env: dict[str, str] | None, output_secrets: tuple[str, ...],
+        binding_fingerprint: str | None, has_binding: bool, cleanup: _ExecutionCleanup,
+    ) -> dict[str, Any]:
         _validate_wait(wait_seconds)
         started = time.monotonic()
         execution_id = str(UUID(execution_id))
         if not source.strip():
             raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
         _validate_source(source)
-        fingerprint = _execution_fingerprint(session_id, source)
+        fingerprint = _execution_fingerprint(session_id, source, binding_fingerprint)
         async with self._execution_lock:
             previous = self._executions.get(execution_id)
             if previous is not None:
@@ -210,7 +268,11 @@ class NativePythonService:
                     watcher_started = False
                     try:
                         if session is None:
-                            owned_session = await self._create_session(ephemeral=True)
+                            owned_session = await self._create_session(
+                                ephemeral=True, execution_env=execution_env,
+                                output_secrets=output_secrets,
+                                isolated_process_group=has_binding,
+                            )
                             session = owned_session
                         cell = await self.submit_cell(session.session_id, source, wait_seconds=0)
                         cell_id = int(cell["cell_id"])
@@ -219,10 +281,12 @@ class NativePythonService:
                         self._executions.update(execution_id, receipt)
                         self._completion_tasks[execution_id] = asyncio.create_task(
                             self._complete_execution(
-                                execution_id, session, cell_id, receipt, started
+                                execution_id, session, cell_id, receipt, started, cleanup
                             )
                         )
                         watcher_started = True
+                        cleanup.transferred = True
+                        self._execution_cleanups[execution_id] = cleanup
                     except BaseException:
                         receipt["state"] = "unknown"
                         receipt["cell"] = None
@@ -275,7 +339,7 @@ class NativePythonService:
 
     async def _complete_execution(
         self, execution_id: str, session: _Session, cell_id: int,
-        receipt: dict[str, Any], started: float
+        receipt: dict[str, Any], started: float, cleanup: _ExecutionCleanup,
     ) -> None:
         try:
             await session.runner.wait_cell(cell_id)
@@ -297,7 +361,11 @@ class NativePythonService:
                     if session.ephemeral:
                         await self._release_session(session)
                 finally:
-                    self._completion_tasks.pop(execution_id, None)
+                    try:
+                        cleanup.run()
+                    finally:
+                        self._execution_cleanups.pop(execution_id, None)
+                        self._completion_tasks.pop(execution_id, None)
 
     async def _release_session(self, session: _Session) -> None:
         async with self._lock:
@@ -391,8 +459,13 @@ def _session_id(value: str) -> str:
     return normalized
 
 
-def _execution_fingerprint(session_id: str | None, source: str) -> str:
-    return hashlib.sha256(json.dumps([session_id, source], ensure_ascii=False).encode()).hexdigest()
+def _execution_fingerprint(
+    session_id: str | None, source: str, binding_fingerprint: str | None = None
+) -> str:
+    values = [session_id, source]
+    if binding_fingerprint is not None:
+        values.append(binding_fingerprint)
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
 
 
 def _validate_wait(wait_seconds: float) -> None:

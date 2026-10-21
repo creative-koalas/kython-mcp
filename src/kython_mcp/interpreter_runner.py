@@ -7,12 +7,16 @@ import asyncio
 import json
 import os
 import select
+import signal
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Dict, List, Optional
+
+from .redaction import SecretRedactor
 
 # A reader checks `_stop` after every poll, so this is also the bound on how long
 # stop-then-join can take.
@@ -30,11 +34,19 @@ class AsyncInterpreterRunner:
         loop: Optional[asyncio.AbstractEventLoop] = None,
         python_executable: Optional[str] = None,
         worker_path: Optional[str] = None,
+        execution_env: dict[str, str] | None = None,
+        output_secrets: tuple[str, ...] = (),
+        isolated_process_group: bool = False,
     ):
         self.name = name
         self._loop = loop or asyncio.get_event_loop()
         self.python_executable = python_executable
         self.worker_path = worker_path
+        self._execution_env = execution_env
+        self._output_secrets = output_secrets
+        self._isolated_process_group = isolated_process_group
+        self._process_group_closed = False
+        self._redactors: dict[str, SecretRedactor] = {}
 
         self._stdin_lock = threading.Lock()
         self._stop = False
@@ -82,7 +94,11 @@ class AsyncInterpreterRunner:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env={**os.environ, **self._execution_env} if self._execution_env is not None else None,
+            start_new_session=self._isolated_process_group,
         )
+        # Only the worker owns the injected environment after startup.
+        self._execution_env = None
 
         self._stdout_thread = threading.Thread(
             target=self._stdout_reader_loop, daemon=True
@@ -149,8 +165,9 @@ class AsyncInterpreterRunner:
 
     def _stdout_reader_loop(self) -> None:
         for line in self._iter_lines(self._proc.stdout):
-            line = line.strip()
-            if not line:
+            if not self._output_secrets:
+                line = line.strip()
+            if not line.strip():
                 continue
             try:
                 msg = json.loads(line)
@@ -168,7 +185,6 @@ class AsyncInterpreterRunner:
 
     def _stderr_reader_loop(self) -> None:
         for line in self._iter_lines(self._proc.stderr):
-            self._stderr_lines.append(line)
             self._publish({"type": "process_stderr", "chunk": line})
 
     def _send_control(self, payload: dict) -> None:
@@ -208,12 +224,39 @@ class AsyncInterpreterRunner:
         """
         msg_type = msg.get("type")
 
+        field = "repr" if msg_type == "result" else "chunk"
+        if msg_type in {"stdout", "stderr", "result", "process_stdout", "process_stderr"}:
+            redactor = self._redactors.setdefault(msg_type, SecretRedactor(self._output_secrets))
+            msg = {**msg, field: redactor.feed(str(msg.get(field) or ""))}
+        if msg_type == "cell_end":
+            for output_type, redactor in self._redactors.items():
+                tail = redactor.feed("", final=True)
+                if not tail:
+                    continue
+                target = "result" if output_type == "result" else (
+                    "stderr" if output_type in {"stderr", "process_stderr"} else "stdout"
+                )
+                self._current_buf[target].append(tail)
+            if msg.get("exception") is not None:
+                msg = {
+                    **msg,
+                    "exception": SecretRedactor(self._output_secrets).feed(
+                        str(msg["exception"]), final=True
+                    ),
+                }
+
         if msg_type == "stdout":
             self._current_buf["stdout"].append(msg.get("chunk", ""))
         elif msg_type == "stderr":
             self._current_buf["stderr"].append(msg.get("chunk", ""))
         elif msg_type == "result":
             self._current_buf["result"].append(msg.get("repr", ""))
+        elif msg_type == "process_stdout" and self._output_secrets:
+            self._current_buf["stdout"].append(msg.get("chunk", ""))
+        elif msg_type == "process_stderr":
+            if self._output_secrets:
+                self._current_buf["stderr"].append(msg.get("chunk", ""))
+            self._stderr_lines.append(msg.get("chunk", ""))
         elif msg_type == "cell_start":
             self._current_buf = {"stdout": [], "stderr": [], "result": []}
             self._last_exc = None
@@ -453,6 +496,23 @@ class AsyncInterpreterRunner:
     def _terminate_process(self) -> None:
         """Stop the worker process; ``close()`` closes the pipes once this returns."""
         if self._proc is None:
+            return
+        if self._isolated_process_group:
+            if self._process_group_closed:
+                return
+            self._process_group_closed = True
+            # This runner started its own session; no other execution shares its group.
+            for group_signal in (signal.SIGTERM, signal.SIGKILL):
+                # Reap an exited group leader before signalling. Darwin reports EPERM
+                # for a group containing only an unreaped zombie instead of ESRCH.
+                self._proc.poll()
+                try:
+                    os.killpg(self._proc.pid, group_signal)
+                except ProcessLookupError:
+                    break
+                if group_signal == signal.SIGTERM:
+                    time.sleep(0.1)
+            self._proc.wait(timeout=1)
             return
         try:
             self._proc.terminate()
