@@ -4,13 +4,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from .executions import ExecutionStore
+from .executions import ExecutionStore, mark_receipt_unknown
 from .interpreter_runner import AsyncInterpreterRunner, BusyError
 from .utils import precheck_syntax
 
@@ -132,11 +133,9 @@ class NativePythonService:
             self._completion_tasks.pop(execution_id, None)
             self._running.pop(execution_id, None)
             previous = self._executions.get(execution_id)
-            if previous is not None and previous[1]["state"] in {"accepted", "running"}:
+            if previous is not None and mark_receipt_unknown(previous[1]):
                 # Cancellation may happen before the watcher coroutine starts at all.
-                receipt = previous[1]
-                receipt.update(state="unknown", cell=None)
-                self._executions.update(execution_id, receipt)
+                self._executions.update(execution_id, previous[1])
         await self._teardown_session(session)
         return {"session_id": normalized}
 
@@ -252,17 +251,17 @@ class NativePythonService:
         if previous is None:
             raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
         receipt = previous[1]
-        active = self._running.get(execution_id)
+        active = self._active_execution(execution_id)
         if active is not None:
             try:
                 receipt["cell"] = _execution_cell(active[0], _cell_snapshot(*active))
             except ValueError:
                 # The worker exited without a final cell result, before its watcher resumed.
                 receipt.update(state="unknown", cell=None)
-        elif receipt["state"] in {"accepted", "running"} and execution_id not in self._submitting:
+        elif execution_id not in self._submitting:
             # Submission or execution ended without persisting a final receipt.
             # No live owner remains to wait for; the durable outcome is unknown.
-            receipt.update(state="unknown", cell=None)
+            self._reconcile_orphaned_receipt(execution_id, receipt)
         cell = receipt["cell"]
         if (
             cell is not None and cell["session_id"] is not None
@@ -360,7 +359,7 @@ class NativePythonService:
 
     async def interrupt_execution(self, execution_id: str) -> dict[str, Any]:
         receipt = await self.execution(execution_id)
-        active = self._running.get(execution_id)
+        active = self._active_execution(execution_id)
         cell = receipt["cell"]
         # A completed cell's watcher may still be pending while this explicit session
         # starts another cell. Only interrupt the observed target, with no intervening await.
@@ -374,6 +373,22 @@ class NativePythonService:
             "state": receipt["state"],
             "interrupt_sent": sent,
         }
+
+    def _active_execution(self, execution_id: str) -> tuple[_Session, int] | None:
+        active = self._running.get(execution_id)
+        if active is None or active[0].session_id not in self._sessions:
+            return None
+        return active
+
+    def _reconcile_orphaned_receipt(self, execution_id: str, receipt: dict[str, Any]) -> None:
+        if execution_id in self._submitting or not mark_receipt_unknown(receipt):
+            return
+        if execution_id in self._completion_tasks:
+            return
+        try:
+            self._executions.update(execution_id, receipt)
+        except (OSError, sqlite3.Error):
+            logger.warning("Failed to persist reconciled unknown receipt %s", execution_id, exc_info=True)
 
     async def _get(self, session_id: str) -> _Session:
         normalized = _session_id(session_id)

@@ -7,6 +7,17 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+INFLIGHT_RECEIPT_STATES = frozenset({"starting", "accepted", "running"})
+
+
+def mark_receipt_unknown(receipt: dict[str, Any]) -> bool:
+    """Transition an orphaned in-flight receipt to unknown; return whether it changed."""
+    if receipt.get("state") not in INFLIGHT_RECEIPT_STATES:
+        return False
+    receipt["state"] = "unknown"
+    receipt["cell"] = None
+    return True
+
 
 class ExecutionStore:
     def __init__(self, path: Path | None) -> None:
@@ -19,13 +30,22 @@ class ExecutionStore:
             "(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL)"
         )
         # A new owner cannot infer whether the previous worker produced effects.
-        for execution_id, raw in self._db.execute("SELECT id, receipt FROM executions"):
-            receipt = json.loads(raw)
-            if receipt["state"] in {"accepted", "running"}:
-                receipt["state"] = "unknown"
-                receipt["cell"] = None
-                self.update(execution_id, receipt)
-        self._db.commit()
+        self.reconcile_inflight_receipts()
+
+    def reconcile_inflight_receipts(self) -> int:
+        """Mark durable in-flight receipts unknown when no live worker owns them."""
+        rows = self._db.execute("SELECT id, receipt FROM executions").fetchall()
+        reconciled = 0
+        with self._db:
+            for execution_id, raw in rows:
+                receipt = json.loads(raw)
+                if mark_receipt_unknown(receipt):
+                    self._db.execute(
+                        "UPDATE executions SET receipt = ? WHERE id = ?",
+                        (json.dumps(receipt), execution_id),
+                    )
+                    reconciled += 1
+        return reconciled
 
     def reserve(self, execution_id: str, fingerprint: str, receipt: dict[str, Any]) -> bool:
         with self._db:

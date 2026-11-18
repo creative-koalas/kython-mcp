@@ -405,3 +405,115 @@ async def test_deleting_running_explicit_session_finishes_receipt_as_unknown() -
     assert receipt["state"] == "unknown"
     assert receipt["cell"] is None
     await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["starting", "accepted", "running"])
+async def test_reopening_store_reconciles_inflight_receipts_and_interrupt_is_idempotent(
+    tmp_path: Path, state: str
+) -> None:
+    import json
+    import sqlite3
+
+    receipt_path = tmp_path / "receipts.sqlite3"
+    execution_id = str(uuid4())
+    seed = NativePythonService(receipt_path=receipt_path)
+    await seed.close()
+
+    payload = {
+        "execution_id": execution_id,
+        "state": state,
+        "cell": {"session_id": "dead-session", "cell_id": 1, "running": True, "done": False},
+        "meta": {"invocation_id": execution_id},
+    }
+    with sqlite3.connect(receipt_path) as db:
+        db.execute(
+            "INSERT INTO executions VALUES (?, ?, ?)",
+            (execution_id, "fp-" + execution_id, json.dumps(payload)),
+        )
+
+    restarted = NativePythonService(receipt_path=receipt_path)
+    try:
+        assert await restarted.list_sessions() == []
+        receipt = await restarted.execution(execution_id)
+        assert receipt["state"] == "unknown"
+        assert receipt["cell"] is None
+        assert receipt["meta"] == {"invocation_id": execution_id}
+
+        first_interrupt = await restarted.interrupt_execution(execution_id)
+        second_interrupt = await restarted.interrupt_execution(execution_id)
+        expected = {
+            "execution_id": execution_id,
+            "session_id": None,
+            "state": "unknown",
+            "interrupt_sent": False,
+        }
+        assert first_interrupt == expected
+        assert second_interrupt == expected
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["starting", "accepted", "running"])
+async def test_interrupt_execution_reconciles_orphaned_receipt_without_live_session(
+    tmp_path: Path, state: str
+) -> None:
+    receipt_path = tmp_path / "receipts.sqlite3"
+    service = NativePythonService(receipt_path=receipt_path)
+    orphan_id = str(uuid4())
+    evicted_id = str(uuid4())
+    try:
+        service._executions.reserve(
+            orphan_id,
+            "fp-" + orphan_id,
+            {
+                "execution_id": orphan_id,
+                "state": state,
+                "cell": {"session_id": "missing", "cell_id": 1, "running": True, "done": False},
+                "meta": {},
+            },
+        )
+        res = await service.interrupt_execution(orphan_id)
+        assert res == {
+            "execution_id": orphan_id,
+            "session_id": None,
+            "state": "unknown",
+            "interrupt_sent": False,
+        }
+        persisted = service._executions.get(orphan_id)
+        assert persisted is not None
+        assert persisted[1]["state"] == "unknown"
+        assert persisted[1]["cell"] is None
+
+        # Simulate a stale _running pointer whose session was already removed from _sessions.
+        session = await service._create_session()
+        service._executions.reserve(
+            evicted_id,
+            "fp-" + evicted_id,
+            {
+                "execution_id": evicted_id,
+                "state": state,
+                "cell": {"session_id": session.session_id, "cell_id": 1, "running": True, "done": False},
+                "meta": {},
+            },
+        )
+        service._running[evicted_id] = (session, 1)
+        service._sessions.pop(session.session_id)
+        try:
+            evicted_res = await service.interrupt_execution(evicted_id)
+            assert evicted_res == {
+                "execution_id": evicted_id,
+                "session_id": None,
+                "state": "unknown",
+                "interrupt_sent": False,
+            }
+            evicted_persisted = service._executions.get(evicted_id)
+            assert evicted_persisted is not None
+            assert evicted_persisted[1]["state"] == "unknown"
+            assert evicted_persisted[1]["cell"] is None
+        finally:
+            service._running.pop(evicted_id, None)
+            await service._teardown_session(session)
+    finally:
+        await service.close()
