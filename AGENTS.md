@@ -8,6 +8,11 @@
 - **`vm-agent` 构建锁定与补丁同步**：`pyproject.toml` 中的 `readme = "README.md"` 为构建元数据依赖，不可删除。`vm-agent` 在 `pyproject.toml` / `uv.lock` 中按精确 Commit 锁定本仓库，并在构建 `Dockerfile.sandbox` 时通过 `vm-agent/patches/execution-context/manifest.json` 校验 `executions.py`、`interpreter_runner.py`、`native.py`、`worker.py` 的源码 SHA-256 后应用执行上下文补丁。升级 `vm-agent` 中的依赖提交时，必须同步变基该补丁清单并重建沙箱镜像才能在测试或生产环境生效。
 - **生命周期与事件循环安全**：执行预留必须在运行用户代码前持久化落盘，卡死子进程的销毁必须受 `SESSION_TEARDOWN_TIMEOUT_SECONDS` 有界超时保护以防拖垮宿主事件循环，一次性临时解释器在提交或落盘异常时也必须对称关闭回收。
 
+## 文档治理
+
+- **仅保留宏观单一事实源**：全仓工程文档严格收敛于顶层 `AGENTS.md` 与 `README.md`，仅阐述库职责边界、跨仓联动与不可从单点代码直接读出的生命周期不变量。严禁抄录类或函数签名、SQLite 表结构字段、环境变量清单或 CLI 参数，严禁将细碎微观规则堆砌进长句。
+- **零过程文档与同步淘汰**：严禁提交设计方案/RFC、性能或 QA 审计报告、迁移流水账、泛化工作流 Skill 或复述代码的子目录 `README.md`。职责边界演进时原地更新唯一归属文档，并在同一提交中删除失效文档。
+
 ## 验证与测试准则
 
 禁止 TDD，默认不新增测试。仅针对生产中静默或不可逆的高危风险保留测试（invocation 幂等与防重放、未完成任务重启转 `unknown`、临时解释器泄漏防护与中断状态观测），测试必须观测真实子进程与 SQLite 回执文件且移除修复后必须失败。
