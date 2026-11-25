@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
@@ -131,4 +133,187 @@ async def test_interrupt_completed_execution_does_not_cancel_new_cell_in_same_se
         assert (await service.execution(old_id, wait_seconds=2))["state"] == "succeeded"
     finally:
         release_old_watcher.set()
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_contract_projects_execution_id_and_terminal_states(tmp_path: Path) -> None:
+    service = NativePythonService(receipt_path=tmp_path / "receipts.db")
+    try:
+        session_id = (await service.create_session(label="analysis"))["session_id"]
+        empty = await service.snapshot(session_id, include_all=False, wait_seconds=0)
+        assert empty["cells"] == []
+        assert "execution_id" not in empty and "state" not in empty
+
+        exec_ok = str(uuid4())
+        await service.execute(
+            exec_ok,
+            "import time\ntime.sleep(.15)\nprint('ok')",
+            session_id=session_id,
+            wait_seconds=0,
+        )
+        running_snap = await service.snapshot(session_id, include_all=False, wait_seconds=0)
+        assert running_snap["execution_id"] == exec_ok
+        assert running_snap["state"] == "running"
+        assert running_snap["cells"][0]["execution_id"] == exec_ok
+        assert running_snap["cells"][0]["state"] == "running"
+
+        done_snap = await asyncio.wait_for(
+            service.snapshot(session_id, include_all=False, wait_seconds=5),
+            timeout=5,
+        )
+        ok_receipt = await service.execution(exec_ok)
+        assert done_snap["execution_id"] == exec_ok
+        assert done_snap["state"] == "succeeded"
+        assert done_snap["cells"] == [ok_receipt["cell"]]
+
+        exec_fail = str(uuid4())
+        fail_receipt = await service.execute(
+            exec_fail, "raise ValueError('boom')", session_id=session_id, wait_seconds=5
+        )
+        all_snap = await service.snapshot(session_id, include_all=True, wait_seconds=0)
+        assert all_snap["execution_id"] == exec_fail
+        assert all_snap["state"] == "failed"
+        assert all_snap["cells"] == [ok_receipt["cell"], fail_receipt["cell"]]
+        assert [cell["execution_id"] for cell in all_snap["cells"]] == [exec_ok, exec_fail]
+        assert [cell["state"] for cell in all_snap["cells"]] == ["succeeded", "failed"]
+
+        direct = await service.submit_cell(session_id, "print('direct')", wait_seconds=5)
+        assert "execution_id" not in direct and direct["state"] == "succeeded"
+        direct_snap = await service.snapshot(session_id, include_all=False, wait_seconds=0)
+        assert "execution_id" not in direct_snap and "state" not in direct_snap
+        assert "execution_id" not in direct_snap["cells"][0]
+        assert direct_snap["cells"][0]["state"] == "succeeded"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_after_worker_exit_is_idempotent_and_preserves_execution_identity(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "receipts.db"
+    service = NativePythonService(receipt_path=db)
+    exec_ok, exec_crash = str(uuid4()), str(uuid4())
+    crash_source = "import os, time\nprint('before', flush=True)\ntime.sleep(.05)\nos._exit(0)"
+    try:
+        session_id = (await service.create_session())["session_id"]
+        ok_receipt = await service.execute(
+            exec_ok, "print('ok')", session_id=session_id, wait_seconds=5
+        )
+        crash_receipt = await service.execute(
+            exec_crash, crash_source, session_id=session_id, wait_seconds=5
+        )
+        assert ok_receipt["state"] == "succeeded"
+        assert crash_receipt["state"] == "unknown" and crash_receipt["cell"] is None
+
+        first_snap = await service.snapshot(session_id, include_all=True, wait_seconds=0)
+        second_snap = await service.snapshot(session_id, include_all=True, wait_seconds=0)
+        assert second_snap == first_snap
+        assert first_snap["execution_id"] == exec_crash
+        assert first_snap["state"] == "unknown"
+        assert [cell["execution_id"] for cell in first_snap["cells"]] == [exec_ok, exec_crash]
+        assert [cell["state"] for cell in first_snap["cells"]] == ["succeeded", "unknown"]
+        crashed_cell = first_snap["cells"][1]
+        assert crashed_cell["source"] == crash_source
+        assert crashed_cell["running"] is False and crashed_cell["done"] is False
+    finally:
+        await service.close()
+
+    restarted = NativePythonService(receipt_path=db)
+    try:
+        reloaded_ok = await restarted.execution(exec_ok)
+        assert reloaded_ok["state"] == "succeeded"
+        assert reloaded_ok["cell"]["execution_id"] == exec_ok
+        assert reloaded_ok["cell"]["state"] == "succeeded"
+        reloaded_crash = await restarted.execution(exec_crash)
+        assert reloaded_crash["state"] == "unknown" and reloaded_crash["cell"] is None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reconciles_orphaned_sqlite_receipt_idempotently(tmp_path: Path) -> None:
+    db = tmp_path / "receipts.db"
+    service = NativePythonService(receipt_path=db)
+    try:
+        session_id = (await service.create_session())["session_id"]
+        exec_live = str(uuid4())
+        await service.execute(exec_live, "print('live')", session_id=session_id, wait_seconds=5)
+
+        legacy_id, orphan_id = str(uuid4()), str(uuid4())
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT INTO executions VALUES (?, ?, ?)",
+                (
+                    legacy_id,
+                    "fp-" + legacy_id,
+                    json.dumps(
+                        {
+                            "execution_id": legacy_id,
+                            "state": "succeeded",
+                            "cell": {
+                                "session_id": session_id,
+                                "cell_id": 2,
+                                "source": "print('legacy')",
+                                "stdout": "legacy\n",
+                            },
+                            "meta": {},
+                        }
+                    ),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO executions VALUES (?, ?, ?)",
+                (
+                    orphan_id,
+                    "fp-" + orphan_id,
+                    json.dumps(
+                        {
+                            "execution_id": orphan_id,
+                            "state": "starting",
+                            "cell": {
+                                "session_id": session_id,
+                                "cell_id": 3,
+                                "source": "print('orphaned')",
+                                "running": True,
+                                "done": False,
+                            },
+                            "meta": {},
+                        }
+                    ),
+                ),
+            )
+
+        first_snap = await service.snapshot(session_id, include_all=True, wait_seconds=0)
+        assert [cell["execution_id"] for cell in first_snap["cells"]] == [
+            exec_live,
+            legacy_id,
+            orphan_id,
+        ]
+        assert [cell["state"] for cell in first_snap["cells"]] == [
+            "succeeded",
+            "succeeded",
+            "unknown",
+        ]
+        assert first_snap["cells"][1]["done"] is True and first_snap["cells"][1]["running"] is False
+        assert first_snap["cells"][2]["source"] == "print('orphaned')"
+        assert first_snap["cells"][2]["running"] is False and first_snap["cells"][2]["done"] is False
+        assert first_snap["execution_id"] == orphan_id
+        assert first_snap["state"] == "unknown"
+
+        orphan_receipt = await service.execution(orphan_id)
+        assert orphan_receipt["state"] == "unknown" and orphan_receipt["cell"] is None
+        with sqlite3.connect(db) as conn:
+            stored_orphan = json.loads(
+                conn.execute("SELECT receipt FROM executions WHERE id = ?", (orphan_id,)).fetchone()[0]
+            )
+        assert stored_orphan["state"] == "unknown" and stored_orphan["cell"] is None
+
+        interrupt = await service.interrupt_execution(orphan_id)
+        assert interrupt["state"] == "unknown" and interrupt["interrupt_sent"] is False
+
+        # Consecutive snapshots remain identical even after SQLite reconciliation clears receipt.cell.
+        assert await service.snapshot(session_id, include_all=True, wait_seconds=0) == first_snap
+    finally:
         await service.close()

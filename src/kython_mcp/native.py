@@ -6,12 +6,22 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from .executions import ExecutionStore, mark_receipt_unknown
+from .executions import (
+    CellObservation,
+    ExecutionState,
+    ExecutionStore,
+    mark_receipt_unknown,
+    parse_cell_id,
+    project_cell,
+    project_receipt,
+    project_session_snapshot,
+)
 from .interpreter_runner import AsyncInterpreterRunner, BusyError
 from .utils import precheck_syntax
 
@@ -30,6 +40,12 @@ class PythonSessionError(RuntimeError):
         self.retryable = retryable
 
 
+@dataclass(frozen=True, slots=True)
+class _CellBinding:
+    execution_id: str
+    source: str = ""
+
+
 @dataclass
 class _Session:
     session_id: str
@@ -38,6 +54,27 @@ class _Session:
     description: str | None = None
     ephemeral: bool = False
     created_at: float = field(default_factory=time.time)
+    cell_bindings: dict[int, _CellBinding] = field(default_factory=dict)
+
+    def bind_cell(self, cell_id: int, execution_id: str, *, source: str = "") -> None:
+        """Bind one cell to its immutable execution_id and remember its source."""
+        existing = self.cell_bindings.get(cell_id)
+        if existing is not None:
+            if existing.execution_id != execution_id:
+                raise ValueError(
+                    f"Cell {cell_id} in session {self.session_id} "
+                    f"is already bound to {existing.execution_id}"
+                )
+            if existing.source or not source:
+                return
+        self.cell_bindings[cell_id] = _CellBinding(execution_id=execution_id, source=source)
+
+    def cell_source(self, cell_id: int) -> str:
+        runner_source = self.runner.get_cell_source(cell_id)
+        if runner_source is not None:
+            return runner_source
+        binding = self.cell_bindings.get(cell_id)
+        return binding.source if binding is not None else ""
 
 
 class NativePythonService:
@@ -121,11 +158,13 @@ class NativePythonService:
         if session is None:
             raise PythonSessionError("SESSION_NOT_FOUND", "Python session was not found.")
         execution_ids = [
-            execution_id
-            for execution_id, (owner, _) in self._running.items()
-            if owner is session
+            execution_id for execution_id, _ in self._session_running_executions(session)
         ]
-        tasks = [self._completion_tasks[execution_id] for execution_id in execution_ids]
+        tasks = [
+            self._completion_tasks[execution_id]
+            for execution_id in execution_ids
+            if execution_id in self._completion_tasks
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -163,7 +202,7 @@ class NativePythonService:
             return _cell_snapshot(session, cell_id)
         try:
             await session.runner.wait_cell(cell_id, timeout=wait_seconds)
-        except TimeoutError:
+        except (TimeoutError, ValueError):
             pass
         return _cell_snapshot(session, cell_id)
 
@@ -197,11 +236,11 @@ class NativePythonService:
                 session = await self._get(session_id) if session_id else None
                 if session is not None and session.runner.is_running:
                     raise PythonSessionError("SESSION_BUSY", "Python session is running a cell.")
-                receipt = {
+                receipt: dict[str, Any] = {
                     "execution_id": execution_id,
-                    "state": "accepted",
+                    "state": ExecutionState.ACCEPTED.value,
                     "cell": None,
-                    "meta": meta or {},
+                    "meta": dict(meta) if meta is not None else {},
                 }
                 if self._executions.reserve(execution_id, fingerprint, receipt):
                     self._submitting.add(execution_id)
@@ -212,9 +251,14 @@ class NativePythonService:
                             owned_session = await self._create_session(ephemeral=True)
                             session = owned_session
                         cell = await self.submit_cell(session.session_id, source, wait_seconds=0)
-                        cell_id = int(cell["cell_id"])
+                        cell_id = _require_cell_id(cell["cell_id"])
+                        session.bind_cell(cell_id, execution_id, source=source)
                         self._running[execution_id] = (session, cell_id)
-                        receipt.update(state="running", cell=_execution_cell(session, cell))
+                        receipt = project_receipt(
+                            {**receipt, "state": ExecutionState.RUNNING.value, "cell": cell},
+                            execution_id=execution_id,
+                            ephemeral=session.ephemeral,
+                        )
                         self._executions.update(execution_id, receipt)
                         self._completion_tasks[execution_id] = asyncio.create_task(
                             self._complete_execution(
@@ -223,8 +267,7 @@ class NativePythonService:
                         )
                         watcher_started = True
                     except BaseException:
-                        receipt["state"] = "unknown"
-                        receipt["cell"] = None
+                        receipt.update(state=ExecutionState.UNKNOWN.value, cell=None)
                         self._executions.update(execution_id, receipt)
                         raise
                     finally:
@@ -250,27 +293,7 @@ class NativePythonService:
         previous = self._executions.get(execution_id)
         if previous is None:
             raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
-        receipt = previous[1]
-        active = self._active_execution(execution_id)
-        if active is not None:
-            try:
-                receipt["cell"] = _execution_cell(active[0], _cell_snapshot(*active))
-            except ValueError:
-                # The worker exited without a final cell result, before its watcher resumed.
-                receipt.update(state="unknown", cell=None)
-        elif execution_id not in self._submitting:
-            # Submission or execution ended without persisting a final receipt.
-            # No live owner remains to wait for; the durable outcome is unknown.
-            self._reconcile_orphaned_receipt(execution_id, receipt)
-        cell = receipt["cell"]
-        if (
-            cell is not None and cell["session_id"] is not None
-            and previous[0] == _execution_fingerprint(None, cell["source"])
-        ):
-            # Older receipts persist the submitted owner choice in their fingerprint.
-            # Normalize only a proven one-shot submission, never guess from cell IDs.
-            cell.update(session_id=None, cell_id=None)
-        return receipt
+        return self._project_stored_receipt(execution_id, previous[0], previous[1])
 
     async def _complete_execution(
         self, execution_id: str, session: _Session, cell_id: int,
@@ -278,14 +301,21 @@ class NativePythonService:
     ) -> None:
         try:
             await session.runner.wait_cell(cell_id)
-            cell = _cell_snapshot(session, cell_id)
-            receipt.update(
-                state="failed" if cell["exception"] else "succeeded",
-                cell=_execution_cell(session, cell),
-            )
+            observation = _read_runner_observation(session, cell_id)
+            terminal_state = observation.state
+            if terminal_state not in {ExecutionState.SUCCEEDED, ExecutionState.FAILED}:
+                receipt.update(state=ExecutionState.UNKNOWN.value, cell=None)
+            else:
+                receipt.update(
+                    state=terminal_state.value,
+                    cell=project_cell(
+                        observation,
+                        execution_id=execution_id,
+                        ephemeral=session.ephemeral,
+                    ),
+                )
         except (ValueError, OSError, asyncio.CancelledError):
-            receipt["state"] = "unknown"
-            receipt["cell"] = None
+            receipt.update(state=ExecutionState.UNKNOWN.value, cell=None)
         finally:
             receipt["meta"]["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
             try:
@@ -327,20 +357,35 @@ class NativePythonService:
     ) -> dict[str, Any]:
         _validate_wait(wait_seconds)
         session = await self._get(session_id)
-        execution_id = next(
-            (key for key, (owner, _) in self._running.items() if owner is session), None
-        )
-        if execution_id is not None:
-            await self.execution(execution_id, wait_seconds=wait_seconds)
-        cells = session.runner.list_cells()
-        if not cells:
-            return {"session": _session_payload(session), "cells": []}
-        cell_ids = sorted({int(cell["cell_id"]) for cell in cells})
-        selected = cell_ids if include_all else [cell_ids[-1]]
-        return {
-            "session": _session_payload(session),
-            "cells": [_cell_snapshot(session, cell_id) for cell_id in selected],
+        if wait_seconds > 0:
+            tasks = self._snapshot_wait_tasks(session, include_all=include_all)
+            if tasks:
+                done, _ = await asyncio.wait(tasks, timeout=wait_seconds)
+                for task in done:
+                    if not task.cancelled() and (exc := task.exception()) is not None:
+                        logger.warning(
+                            "Execution completion task failed before snapshot",
+                            exc_info=exc,
+                        )
+                session = await self._get(session_id)
+
+        persisted_by_cell = {
+            cell_id: (execution_id, fingerprint, receipt)
+            for cell_id, (execution_id, fingerprint, receipt) in self._executions.find_by_session(
+                session.session_id
+            ).items()
+            if not _is_legacy_one_shot_receipt(fingerprint, receipt)
         }
+        cell_ids = sorted(self._session_cell_ids(session, persisted_by_cell))
+        if not cell_ids:
+            return project_session_snapshot(_session_payload(session), [])
+
+        selected = cell_ids if include_all else [cell_ids[-1]]
+        projected_cells = [
+            self._project_session_cell(session, cell_id, persisted_by_cell)
+            for cell_id in selected
+        ]
+        return project_session_snapshot(_session_payload(session), projected_cells)
 
     async def send_input(self, session_id: str, data: str) -> dict[str, Any]:
         session = await self._get(session_id)
@@ -374,16 +419,130 @@ class NativePythonService:
             "interrupt_sent": sent,
         }
 
+    def _session_running_executions(self, session: _Session) -> list[tuple[str, int]]:
+        return [
+            (execution_id, cell_id)
+            for execution_id, (owner, cell_id) in self._running.items()
+            if owner is session
+        ]
+
+    def _session_cell_ids(
+        self,
+        session: _Session,
+        persisted_by_cell: Mapping[int, Any] | None = None,
+    ) -> set[int]:
+        cell_ids = {_require_cell_id(cell["cell_id"]) for cell in session.runner.list_cells()}
+        cell_ids.update(cell_id for _, cell_id in self._session_running_executions(session))
+        cell_ids.update(session.cell_bindings)
+        if persisted_by_cell:
+            cell_ids.update(persisted_by_cell)
+        return cell_ids
+
+    def _snapshot_wait_tasks(
+        self, session: _Session, *, include_all: bool
+    ) -> list[asyncio.Task[None]]:
+        running = self._session_running_executions(session)
+        if not running:
+            return []
+        if include_all:
+            target_ids = [execution_id for execution_id, _ in running]
+        else:
+            latest_execution_id, latest_running_cell_id = max(running, key=lambda item: item[1])
+            known_cell_ids = self._session_cell_ids(session)
+            if known_cell_ids and latest_running_cell_id < max(known_cell_ids):
+                return []
+            target_ids = [latest_execution_id]
+        return [
+            self._completion_tasks[execution_id]
+            for execution_id in target_ids
+            if execution_id in self._completion_tasks
+        ]
+
     def _active_execution(self, execution_id: str) -> tuple[_Session, int] | None:
         active = self._running.get(execution_id)
         if active is None or active[0].session_id not in self._sessions:
             return None
         return active
 
+    def _project_stored_receipt(
+        self, execution_id: str, fingerprint: str, receipt: dict[str, Any]
+    ) -> dict[str, Any]:
+        active = self._active_execution(execution_id)
+        live_observation: CellObservation | None = None
+        ephemeral = False
+        if active is not None:
+            session, cell_id = active
+            ephemeral = session.ephemeral
+            try:
+                live_observation = _read_runner_observation(session, cell_id)
+            except ValueError:
+                # The worker exited without a final cell result, before its watcher resumed.
+                receipt.update(state=ExecutionState.UNKNOWN.value, cell=None)
+        else:
+            # Submission or execution ended without persisting a final receipt.
+            # No live owner remains to wait for; the durable outcome is unknown.
+            self._reconcile_orphaned_receipt(execution_id, receipt)
+            ephemeral = _is_legacy_one_shot_receipt(fingerprint, receipt)
+        return project_receipt(
+            receipt,
+            execution_id=execution_id,
+            ephemeral=ephemeral,
+            live_observation=live_observation,
+        )
+
+    def _resolve_cell_receipt(
+        self,
+        session: _Session,
+        cell_id: int,
+        persisted_by_cell: Mapping[int, tuple[str, str, dict[str, Any]]],
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        persisted = persisted_by_cell.get(cell_id)
+        binding = session.cell_bindings.get(cell_id)
+        if binding is None or (persisted is not None and persisted[0] == binding.execution_id):
+            entry = persisted
+        else:
+            stored = self._executions.get(binding.execution_id)
+            entry = (binding.execution_id, stored[0], stored[1]) if stored is not None else None
+        if entry is None:
+            return None
+
+        execution_id, _, receipt = entry
+        raw_cell = receipt.get("cell")
+        source = str(raw_cell.get("source") or "") if isinstance(raw_cell, dict) else ""
+        session.bind_cell(cell_id, execution_id, source=source)
+        return entry
+
+    def _project_session_cell(
+        self,
+        session: _Session,
+        cell_id: int,
+        persisted_by_cell: Mapping[int, tuple[str, str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        entry = self._resolve_cell_receipt(session, cell_id, persisted_by_cell)
+        if entry is None:
+            return _cell_snapshot(session, cell_id)
+
+        execution_id, fingerprint, raw_receipt = entry
+        projected_receipt = self._project_stored_receipt(execution_id, fingerprint, raw_receipt)
+        if projected_receipt["cell"] is not None:
+            return projected_receipt["cell"]
+
+        return project_cell(
+            CellObservation(
+                session_id=session.session_id,
+                cell_id=cell_id,
+                source=session.cell_source(cell_id),
+            ),
+            execution_id=execution_id,
+            state=projected_receipt["state"],
+        )
+
     def _reconcile_orphaned_receipt(self, execution_id: str, receipt: dict[str, Any]) -> None:
-        if execution_id in self._submitting or not mark_receipt_unknown(receipt):
-            return
-        if execution_id in self._completion_tasks:
+        if (
+            execution_id in self._submitting
+            or execution_id in self._completion_tasks
+            or not mark_receipt_unknown(receipt)
+        ):
             return
         try:
             self._executions.update(execution_id, receipt)
@@ -410,15 +569,30 @@ def _execution_fingerprint(session_id: str | None, source: str) -> str:
     return hashlib.sha256(json.dumps([session_id, source], ensure_ascii=False).encode()).hexdigest()
 
 
+def _is_legacy_one_shot_receipt(fingerprint: str, receipt: dict[str, Any]) -> bool:
+    """Older receipts persist the submitted owner choice in their fingerprint.
+
+    Normalize only a proven one-shot submission, never guess from cell IDs.
+    """
+    cell = receipt.get("cell")
+    return (
+        isinstance(cell, dict)
+        and cell.get("session_id") is not None
+        and isinstance(cell.get("source"), str)
+        and fingerprint == _execution_fingerprint(None, cell["source"])
+    )
+
+
+def _require_cell_id(value: object) -> int:
+    parsed = parse_cell_id(value)
+    if parsed is None:
+        raise TypeError(f"Expected integer cell_id, got {value!r}")
+    return parsed
+
+
 def _validate_wait(wait_seconds: float) -> None:
     if not 0 <= wait_seconds <= 330:
         raise PythonSessionError("INVALID_WAIT", "wait_seconds must be between 0 and 330.")
-
-
-def _execution_cell(session: _Session, cell: dict[str, Any]) -> dict[str, Any]:
-    if session.ephemeral:
-        cell.update(session_id=None, cell_id=None)
-    return cell
 
 
 def _validate_source(source: str) -> None:
@@ -446,31 +620,47 @@ def _session_payload(session: _Session) -> dict[str, Any]:
     }
 
 
-def _cell_snapshot(session: _Session, cell_id: int) -> dict[str, Any]:
+def _read_runner_observation(session: _Session, cell_id: int) -> CellObservation:
     try:
         snapshot = session.runner.get_cell_snapshot(cell_id)
     except ValueError:
         if not session.runner.is_running:
             raise
         output = session.runner.get_current_output()
-        snapshot = {
-            "cell_id": cell_id,
-            "source": session.runner.get_cell_source(cell_id),
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "result": output.result,
-            "exception": None,
-            "running": True,
-            "done": False,
-        }
-    return {
-        "session_id": session.session_id,
-        "cell_id": int(snapshot["cell_id"]),
-        "source": str(snapshot.get("source") or ""),
-        "stdout": str(snapshot.get("stdout") or ""),
-        "stderr": str(snapshot.get("stderr") or ""),
-        "result": str(snapshot.get("result") or ""),
-        "exception": snapshot.get("exception"),
-        "running": bool(snapshot.get("running")),
-        "done": bool(snapshot.get("done")),
-    }
+        return CellObservation(
+            session_id=session.session_id,
+            cell_id=cell_id,
+            source=session.cell_source(cell_id),
+            stdout=output.stdout,
+            stderr=output.stderr,
+            result=output.result,
+            running=True,
+            done=False,
+        )
+    observation = CellObservation.from_mapping(
+        snapshot,
+        session_id=session.session_id,
+        cell_id=_require_cell_id(snapshot["cell_id"]),
+    )
+    # Guard against stale `_active_cid` left behind if the worker exited without `cell_end`.
+    if not observation.done and observation.running and not session.runner.is_running:
+        raise ValueError(f"Cell {cell_id} exited without completion")
+    return observation
+
+
+def _cell_snapshot(session: _Session, cell_id: int) -> dict[str, Any]:
+    try:
+        observation = _read_runner_observation(session, cell_id)
+    except ValueError:
+        if session.runner.get_cell_source(cell_id) is None and cell_id not in session.cell_bindings:
+            raise
+        observation = CellObservation(
+            session_id=session.session_id,
+            cell_id=cell_id,
+            source=session.cell_source(cell_id),
+        )
+    binding = session.cell_bindings.get(cell_id)
+    return project_cell(
+        observation,
+        execution_id=binding.execution_id if binding is not None else None,
+    )
