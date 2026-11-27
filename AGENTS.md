@@ -5,7 +5,7 @@
 ## 职责边界与跨仓联动
 
 - **纯原生库边界**：代码收敛于 `src/kython_mcp/`（`native.py` 会话与执行编排、`executions.py` SQLite 回执存储、`interpreter_runner.py` 与 `worker.py` 子进程隔离运行器）。严禁重新引入历史 MCP Server 传输层、`/tools` 动态发现语义或独立容器部署清单。
-- **`vm-agent` 构建锁定与补丁同步**：`pyproject.toml` 中的 `readme = "README.md"` 为构建元数据依赖，不可删除。`vm-agent` 在 `pyproject.toml` / `uv.lock` 中按精确 Commit 锁定本仓库，并在构建 `Dockerfile.sandbox` 时通过 `vm-agent/patches/execution-context/manifest.json` 校验 `executions.py`、`interpreter_runner.py`、`native.py`、`worker.py` 的源码 SHA-256 后应用执行上下文补丁。升级 `vm-agent` 中的依赖提交时，必须同步变基该补丁清单并重建沙箱镜像才能在测试或生产环境生效。
+- **宿主集成**：本库原生绑定不透明会话所有者和逐次执行来源。已验证的执行证明按次传递给工作进程。`vm-agent` 锁定本库的精确提交构建沙箱镜像。
 - **生命周期与事件循环安全**：执行预留必须在运行用户代码前持久化落盘，卡死子进程的销毁必须受 `SESSION_TEARDOWN_TIMEOUT_SECONDS` 有界超时保护以防拖垮宿主事件循环，一次性临时解释器在提交或落盘异常时也必须对称关闭回收。
 
 ## 文档治理

@@ -260,7 +260,7 @@ class AsyncInterpreterRunner:
             result="".join(self._current_buf["result"]),
         )
 
-    def start_cell(self, source: str) -> int:
+    def start_cell(self, source: str, *, execution_context: str | None = None) -> int:
         if self._running:
             raise BusyError(f"Session {self.name} is already running cell {self._cell_id}")
 
@@ -272,7 +272,10 @@ class AsyncInterpreterRunner:
         self._cell_sources[cid] = source
         self._active_source = source
 
-        self._send_control({"type": "run_cell", "cell_id": cid, "source": source})
+        self._send_control({
+            "type": "run_cell", "cell_id": cid, "source": source,
+            "execution_context": execution_context,
+        })
         return cid
 
     async def wait_cell(self, cid: int, timeout: Optional[float] = None) -> Dict[str, object]:

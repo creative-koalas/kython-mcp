@@ -50,6 +50,7 @@ class _CellBinding:
 class _Session:
     session_id: str
     runner: AsyncInterpreterRunner
+    owner: str | None = None
     label: str | None = None
     description: str | None = None
     ephemeral: bool = False
@@ -106,14 +107,17 @@ class NativePythonService:
     async def create_session(
         self,
         *,
+        owner: str | None = None,
         label: str | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
-        return _session_payload(await self._create_session(label=label, description=description))
+        return _session_payload(await self._create_session(owner=owner, label=label, description=description))
 
     async def _create_session(
-        self, *, label: str | None = None, description: str | None = None, ephemeral: bool = False
+        self, *, owner: str | None, label: str | None = None,
+        description: str | None = None, ephemeral: bool = False,
     ) -> _Session:
+        _validate_source_key(owner)
         async with self._lock:
             session_id = uuid4().hex
             runner = AsyncInterpreterRunner(
@@ -123,6 +127,7 @@ class NativePythonService:
             session = _Session(
                 session_id=session_id,
                 runner=runner,
+                owner=owner,
                 label=_optional_text(label),
                 description=_optional_text(description),
                 ephemeral=ephemeral,
@@ -130,31 +135,39 @@ class NativePythonService:
             self._sessions[session_id] = session
         return session
 
-    async def list_sessions(self) -> list[dict[str, Any]]:
+    async def list_sessions(self, *, owner: str | None = None) -> list[dict[str, Any]]:
         async with self._lock:
             sessions = sorted(self._sessions.values(), key=lambda item: item.created_at)
-            return [_session_payload(session) for session in sessions if not session.ephemeral]
+            _validate_source_key(owner)
+            return [
+                _session_payload(session) for session in sessions
+                if not session.ephemeral and session.owner == owner
+            ]
 
     async def update_session(
         self,
         session_id: str,
         *,
+        owner: str | None = None,
         label: str | None,
         description: str | None,
         update_label: bool,
         update_description: bool,
     ) -> dict[str, Any]:
-        session = await self._get(session_id)
+        session = await self._get(session_id, owner=owner)
         if update_label:
             session.label = _optional_text(label)
         if update_description:
             session.description = _optional_text(description)
         return _session_payload(session)
 
-    async def delete_session(self, session_id: str) -> dict[str, str]:
+    async def delete_session(self, session_id: str, *, owner: str | None = None) -> dict[str, str]:
         normalized = _session_id(session_id)
         async with self._lock:
-            session = self._sessions.pop(normalized, None)
+            session = self._sessions.get(normalized)
+            if session is not None:
+                _check_owner(session.owner, owner)
+                del self._sessions[normalized]
         if session is None:
             raise PythonSessionError("SESSION_NOT_FOUND", "Python session was not found.")
         execution_ids = [
@@ -184,14 +197,16 @@ class NativePythonService:
         source: str,
         *,
         wait_seconds: float,
+        owner: str | None = None,
+        execution_context: str | None = None,
     ) -> dict[str, Any]:
         source = str(source or "")
         if not source.strip():
             raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
         _validate_source(source)
-        session = await self._get(session_id)
+        session = await self._get(session_id, owner=owner)
         try:
-            cell_id = session.runner.start_cell(source)
+            cell_id = session.runner.start_cell(source, execution_context=execution_context)
         except BusyError as exc:
             raise PythonSessionError(
                 "SESSION_BUSY",
@@ -214,6 +229,9 @@ class NativePythonService:
         session_id: str | None = None,
         wait_seconds: float = 330,
         meta: dict[str, Any] | None = None,
+        owner: str | None = None,
+        origin: str | None = None,
+        execution_context: str | None = None,
     ) -> dict[str, Any]:
         """Submit once, then observe that submission even if the caller disconnects."""
         _validate_wait(wait_seconds)
@@ -222,10 +240,17 @@ class NativePythonService:
         if not source.strip():
             raise PythonSessionError("INVALID_SOURCE", "Python source is required.")
         _validate_source(source)
-        fingerprint = _execution_fingerprint(session_id, source)
+        _validate_source_key(owner)
+        _validate_source_key(origin)
+        if (owner is None) != (origin is None):
+            raise PythonSessionError(
+                "EXECUTION_SOURCE_REQUIRED", "Execution owner and origin must be supplied together."
+            )
+        fingerprint = _execution_fingerprint(session_id, source, owner, origin)
         async with self._execution_lock:
             previous = self._executions.get(execution_id)
             if previous is not None:
+                _check_execution_owner(previous[1], owner, origin)
                 if previous[0] != fingerprint:
                     raise PythonSessionError(
                         "EXECUTION_ID_CONFLICT", "Execution ID already identifies different code."
@@ -233,7 +258,7 @@ class NativePythonService:
             else:
                 # Validate explicit sessions before recording acceptance. A durable reservation
                 # precedes every worker dispatch; a crash in between becomes unknown, not replay.
-                session = await self._get(session_id) if session_id else None
+                session = await self._get(session_id, owner=owner) if session_id else None
                 if session is not None and session.runner.is_running:
                     raise PythonSessionError("SESSION_BUSY", "Python session is running a cell.")
                 receipt: dict[str, Any] = {
@@ -242,15 +267,20 @@ class NativePythonService:
                     "cell": None,
                     "meta": dict(meta) if meta is not None else {},
                 }
+                if owner is not None:
+                    receipt.update(_execution_owner=owner, _runtime_origin=origin)
                 if self._executions.reserve(execution_id, fingerprint, receipt):
                     self._submitting.add(execution_id)
                     owned_session = None
                     watcher_started = False
                     try:
                         if session is None:
-                            owned_session = await self._create_session(ephemeral=True)
+                            owned_session = await self._create_session(owner=owner, ephemeral=True)
                             session = owned_session
-                        cell = await self.submit_cell(session.session_id, source, wait_seconds=0)
+                        cell = await self.submit_cell(
+                            session.session_id, source, wait_seconds=0, owner=owner,
+                            execution_context=execution_context,
+                        )
                         cell_id = _require_cell_id(cell["cell_id"])
                         session.bind_cell(cell_id, execution_id, source=source)
                         self._running[execution_id] = (session, cell_id)
@@ -278,12 +308,17 @@ class NativePythonService:
                                     await self._release_session(owned_session)
                         finally:
                             self._submitting.discard(execution_id)
-        return await self.execution(execution_id, wait_seconds=wait_seconds)
+        return await self.execution(execution_id, wait_seconds=wait_seconds, owner=owner, origin=origin)
 
     async def execution(
-        self, execution_id: str, *, wait_seconds: float = 0
+        self, execution_id: str, *, wait_seconds: float = 0,
+        owner: str | None = None, origin: str | None = None,
     ) -> dict[str, Any]:
         _validate_wait(wait_seconds)
+        previous = self._executions.get(execution_id)
+        if previous is None:
+            raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
+        _check_execution_owner(previous[1], owner, origin)
         task = self._completion_tasks.get(execution_id)
         if task is not None and wait_seconds > 0:
             try:
@@ -293,7 +328,10 @@ class NativePythonService:
         previous = self._executions.get(execution_id)
         if previous is None:
             raise PythonSessionError("EXECUTION_NOT_FOUND", "Python execution receipt not found.")
-        return self._project_stored_receipt(execution_id, previous[0], previous[1])
+        result = self._project_stored_receipt(execution_id, previous[0], previous[1])
+        result.pop("_execution_owner", None)
+        result.pop("_runtime_origin", None)
+        return result
 
     async def _complete_execution(
         self, execution_id: str, session: _Session, cell_id: int,
@@ -353,10 +391,11 @@ class NativePythonService:
         session_id: str,
         *,
         include_all: bool,
+        owner: str | None = None,
         wait_seconds: float = 330,
     ) -> dict[str, Any]:
         _validate_wait(wait_seconds)
-        session = await self._get(session_id)
+        session = await self._get(session_id, owner=owner)
         if wait_seconds > 0:
             tasks = self._snapshot_wait_tasks(session, include_all=include_all)
             if tasks:
@@ -367,7 +406,7 @@ class NativePythonService:
                             "Execution completion task failed before snapshot",
                             exc_info=exc,
                         )
-                session = await self._get(session_id)
+                session = await self._get(session_id, owner=owner)
 
         persisted_by_cell = {
             cell_id: (execution_id, fingerprint, receipt)
@@ -387,8 +426,8 @@ class NativePythonService:
         ]
         return project_session_snapshot(_session_payload(session), projected_cells)
 
-    async def send_input(self, session_id: str, data: str) -> dict[str, Any]:
-        session = await self._get(session_id)
+    async def send_input(self, session_id: str, data: str, *, owner: str | None = None) -> dict[str, Any]:
+        session = await self._get(session_id, owner=owner)
         if not session.runner.is_running:
             raise PythonSessionError("NO_RUNNING_CELL", "No Python cell is awaiting input.")
         if not data:
@@ -396,14 +435,14 @@ class NativePythonService:
         session.runner.send_stdin(data)
         return {"session_id": session.session_id, "bytes_sent": len(data.encode("utf-8"))}
 
-    async def interrupt(self, session_id: str) -> dict[str, Any]:
-        session = await self._get(session_id)
+    async def interrupt(self, session_id: str, *, owner: str | None = None) -> dict[str, Any]:
+        session = await self._get(session_id, owner=owner)
         if not session.runner.cancel_current_cell():
             raise PythonSessionError("NO_RUNNING_CELL", "No Python cell is running.")
         return {"session_id": session.session_id, "interrupt_sent": True}
 
-    async def interrupt_execution(self, execution_id: str) -> dict[str, Any]:
-        receipt = await self.execution(execution_id)
+    async def interrupt_execution(self, execution_id: str, *, owner: str | None = None) -> dict[str, Any]:
+        receipt = await self.execution(execution_id, owner=owner)
         active = self._active_execution(execution_id)
         cell = receipt["cell"]
         # A completed cell's watcher may still be pending while this explicit session
@@ -549,12 +588,13 @@ class NativePythonService:
         except (OSError, sqlite3.Error):
             logger.warning("Failed to persist reconciled unknown receipt %s", execution_id, exc_info=True)
 
-    async def _get(self, session_id: str) -> _Session:
+    async def _get(self, session_id: str, *, owner: str | None) -> _Session:
         normalized = _session_id(session_id)
         async with self._lock:
             session = self._sessions.get(normalized)
         if session is None:
             raise PythonSessionError("SESSION_NOT_FOUND", "Python session was not found.")
+        _check_owner(session.owner, owner)
         return session
 
 
@@ -565,8 +605,29 @@ def _session_id(value: str) -> str:
     return normalized
 
 
-def _execution_fingerprint(session_id: str | None, source: str) -> str:
-    return hashlib.sha256(json.dumps([session_id, source], ensure_ascii=False).encode()).hexdigest()
+def _validate_source_key(key: str | None) -> None:
+    if key is not None and (not isinstance(key, str) or not key.strip() or len(key) > 8192):
+        raise PythonSessionError("EXECUTION_SOURCE_REQUIRED", "A bounded execution source is required.")
+
+
+def _check_owner(actual: str | None, expected: str | None) -> None:
+    _validate_source_key(expected)
+    if actual != expected:
+        raise PythonSessionError("SESSION_SOURCE_MISMATCH", "Python session belongs to another execution source.")
+
+
+def _check_execution_owner(receipt: Mapping[str, Any], owner: str | None, origin: str | None) -> None:
+    _check_owner(receipt.get("_execution_owner"), owner)
+    _validate_source_key(origin)
+    if origin is not None and receipt.get("_runtime_origin") != origin:
+        raise PythonSessionError("EXECUTION_SOURCE_MISMATCH", "Execution source differs from its original submission.")
+
+
+def _execution_fingerprint(
+    session_id: str | None, source: str, owner: str | None = None, origin: str | None = None,
+) -> str:
+    fields = [session_id, source] if owner is None else [session_id, source, owner, origin]
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
 
 
 def _is_legacy_one_shot_receipt(fingerprint: str, receipt: dict[str, Any]) -> bool:
@@ -579,7 +640,9 @@ def _is_legacy_one_shot_receipt(fingerprint: str, receipt: dict[str, Any]) -> bo
         isinstance(cell, dict)
         and cell.get("session_id") is not None
         and isinstance(cell.get("source"), str)
-        and fingerprint == _execution_fingerprint(None, cell["source"])
+        and fingerprint == _execution_fingerprint(
+            None, cell["source"], receipt.get("_execution_owner"), receipt.get("_runtime_origin"),
+        )
     )
 
 

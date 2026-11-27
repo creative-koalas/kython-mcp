@@ -122,12 +122,17 @@ sys.displayhook = _displayhook
 sys.stdin = _QueueReader(stdin_queue)
 
 
-def _run_cell(cell_id: int, source: str) -> None:
+def _run_cell(cell_id: int, source: str, execution_context: str | None = None) -> None:
     cell_idle.clear()
     _send({"type": "cell_start", "cell_id": cell_id})
     t0 = time.perf_counter()
     exc_text = None
 
+    # The parent transports this separately from source and receipts. Each worker
+    # runs only one cell at a time; child processes inherit this exact execution.
+    os.environ.pop("WORKSPACE_EXECUTION_CONTEXT", None)
+    if execution_context:
+        os.environ["WORKSPACE_EXECUTION_CONTEXT"] = execution_context
     try:
         try:
             code = compile(source, "<cell>", "single")
@@ -136,6 +141,8 @@ def _run_cell(cell_id: int, source: str) -> None:
         exec(code, _globals, _globals)
     except BaseException as exc:
         exc_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    finally:
+        os.environ.pop("WORKSPACE_EXECUTION_CONTEXT", None)
 
     dt_ms = (time.perf_counter() - t0) * 1000.0
     # The parent can submit again as soon as it receives cell_end. Publish
@@ -185,7 +192,7 @@ def main() -> None:
     # Cells execute in the main thread so that SIGINT naturally raises
     # KeyboardInterrupt, interrupting even C-level blocking calls.
     for msg in iter(cell_queue.get, None):
-        _run_cell(int(msg.get("cell_id")), msg.get("source", ""))
+        _run_cell(int(msg.get("cell_id")), msg.get("source", ""), msg.get("execution_context"))
 
 
 if __name__ == "__main__":

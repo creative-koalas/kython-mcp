@@ -317,3 +317,40 @@ async def test_snapshot_reconciles_orphaned_sqlite_receipt_idempotently(tmp_path
         assert await service.snapshot(session_id, include_all=True, wait_seconds=0) == first_snap
     finally:
         await service.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_receipt_and_transient_proof_survive_upgrade(tmp_path: Path) -> None:
+    db = tmp_path / "receipts.db"
+    service = NativePythonService(receipt_path=db)
+    execution_id = str(uuid4())
+    owner, origin = "session-principal", "event-origin"
+    proof = "temporary-proof-for-one-cell"
+    source = "import os; print(len(os.environ.get('WORKSPACE_EXECUTION_CONTEXT', '')))"
+    try:
+        session = (await service.create_session(owner=owner))["session_id"]
+        original = await service.execute(
+            execution_id, source, session_id=session, owner=owner, origin=origin,
+            execution_context=proof,
+        )
+        assert original["cell"]["stdout"].strip() == str(len(proof))
+        next_cell = await service.submit_cell(session, source, owner=owner, wait_seconds=3)
+        assert next_cell["stdout"].strip() == "0"
+        assert await service.list_sessions() == []
+        assert (await service.snapshot(session, owner=owner, include_all=True))["cells"][0]["execution_id"] == execution_id
+        assert not {"_execution_owner", "_runtime_origin"} & original.keys()
+    finally:
+        await service.close()
+    assert proof.encode() not in db.read_bytes()
+
+    restarted = NativePythonService(receipt_path=db)
+    try:
+        for request in ({}, {"owner": "other"}, {"owner": owner, "origin": "another-event"}):
+            with pytest.raises(PythonSessionError, match="source"):
+                await restarted.execution(execution_id, **request)
+        assert await restarted.execute(
+            execution_id, source, session_id=session, owner=owner, origin=origin,
+            execution_context="rotated-proof",
+        ) == original
+    finally:
+        await restarted.close()
